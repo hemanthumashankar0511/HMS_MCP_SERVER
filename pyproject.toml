@@ -1,0 +1,21 @@
+[project]
+name = "hms-mcp-poc"
+version = "0.1.0"
+description = "Minimal Hive Metastore MCP server (single tool PoC)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "thrift>=0.20",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+hivemind-mcp = "hivemind.hivemind_server:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hivemind"]
