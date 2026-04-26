@@ -1,9 +1,18 @@
 [project]
-name = "hms-mcp-poc"
+name = "hivemind-mcp"
 version = "0.1.0"
-description = "Minimal Hive Metastore MCP server (single tool PoC)"
+description = "MCP server for Apache Hive Metastore — read-only discovery tools (list DBs/tables, schema, stats, partitions, DDL) for AI agents."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.14.4"
+keywords = ["mcp", "hive", "hive-metastore", "hms", "thrift", "cursor", "fastmcp", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+]
 dependencies = [
     "fastmcp>=2.0",
     "thrift>=0.20",
