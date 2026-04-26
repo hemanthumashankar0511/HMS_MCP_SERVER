@@ -40,7 +40,7 @@ HiveMind is an MCP (Model Context Protocol) server that exposes Apache Hive Meta
    Create a `.env` file in the project root with your cluster details:
 
    ```env
-   HMS_HOST=10.140.143.128
+   HMS_HOST=<YOUR_HMS_HOST>
    HMS_PORT=9083
    ```
 
@@ -84,7 +84,7 @@ pytest tests/ -v
 Integration tests require `HMS_HOST` to be set and reachable:
 
 ```bash
-HMS_HOST=10.140.143.128 pytest tests/test_integration.py -v
+HMS_HOST=<YOUR_HMS_HOST> pytest tests/test_integration.py -v
 ```
 
 ## Security notes
