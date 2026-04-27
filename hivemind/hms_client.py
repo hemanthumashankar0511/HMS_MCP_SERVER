@@ -1,13 +1,3 @@
-"""
-HiveMind — HMS Thrift client wrapper.
-
-Wraps ThriftHiveMetastore.Client with:
-- Auto-reconnect on transport failure (one retry)
-- Credential sanitisation on table parameters
-- Safe caps on partition fetches (never unbounded)
-- Pure discovery methods only (no mutations)
-"""
-
 from __future__ import annotations
 
 import logging
@@ -22,30 +12,22 @@ from thrift.transport.TTransport import TTransportException
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Thrift bindings path (gen-py lives two levels up from this file)
-# ---------------------------------------------------------------------------
 _GEN = Path(__file__).resolve().parent.parent / "gen-py"
 if _GEN.is_dir() and str(_GEN) not in sys.path:
     sys.path.insert(0, str(_GEN))
 
-# ---------------------------------------------------------------------------
-# Keys to redact from TBLPROPERTIES before returning to callers
-# ---------------------------------------------------------------------------
-_REDACT_EXACT: frozenset[str] = frozenset(
-    {
-        "fs.s3.awsAccessKeyId",
-        "fs.s3.awsSecretAccessKey",
-        "fs.azure.account.key",
-        "google.cloud.auth.service.account.json.keyfile",
-    }
-)
+_REDACT_EXACT: frozenset[str] = frozenset({
+    "fs.s3.awsAccessKeyId",
+    "fs.s3.awsSecretAccessKey",
+    "fs.azure.account.key",
+    "google.cloud.auth.service.account.json.keyfile",
+})
+
 _REDACT_PATTERNS: tuple[re.Pattern, ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (r"key", r"secret", r"password", r"token", r"credential", r"access")
 )
 
-# Short names for common Java class suffixes so output stays readable
 _FORMAT_ALIASES: dict[str, str] = {
     "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat": "ORC",
     "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat": "ORC",
@@ -60,7 +42,6 @@ _FORMAT_ALIASES: dict[str, str] = {
     "org.apache.hadoop.hive.ql.io.RCFileOutputFormat": "RCFile",
 }
 
-# Column scan cap per database when doing keyword search
 _SEARCH_TABLE_CAP = 50
 
 
@@ -69,7 +50,6 @@ def _friendly_format(class_name: str) -> str:
 
 
 def _sanitise_params(params: dict[str, str]) -> dict[str, str]:
-    """Return a copy of params with sensitive values replaced by [REDACTED]."""
     out: dict[str, str] = {}
     for k, v in params.items():
         if k in _REDACT_EXACT or any(p.search(k) for p in _REDACT_PATTERNS):
@@ -88,12 +68,7 @@ def _field_to_dict(f: Any) -> dict[str, str]:
 
 
 class HMSClient:
-    """
-    Thin wrapper around ThriftHiveMetastore.Client for discovery queries.
-
-    All methods attempt one automatic reconnect if the transport drops.
-    No mutation methods are exposed.
-    """
+    """Thin Thrift wrapper for HMS discovery queries. Read-only, auto-reconnects once on failure."""
 
     def __init__(self, host: str, port: int = 9083, timeout_ms: int = 10_000) -> None:
         self._host = host
@@ -102,10 +77,6 @@ class HMSClient:
         self._transport: TTransport.TBufferedTransport | None = None
         self._client: Any = None
         self._connect()
-
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
 
     def _connect(self) -> None:
         try:
@@ -131,11 +102,11 @@ class HMSClient:
         logger.info("Connected to HMS at %s:%d", self._host, self._port)
 
     def _call(self, fn_name: str, *args: Any) -> Any:
-        """Call a Thrift method, retrying once on transport failure."""
+        """Calls a Thrift method, retrying once on transport failure."""
         try:
             return getattr(self._client, fn_name)(*args)
         except TTransportException:
-            logger.warning("Transport error on %s — reconnecting", fn_name)
+            logger.warning("Transport error on %s - reconnecting", fn_name)
             self._connect()
             return getattr(self._client, fn_name)(*args)
 
@@ -150,25 +121,13 @@ class HMSClient:
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Discovery methods
-    # ------------------------------------------------------------------
-
     def get_all_databases(self) -> list[str]:
-        """Returns sorted list of all database names."""
         return sorted(self._call("get_all_databases"))
 
     def get_all_tables(self, database: str) -> list[str]:
-        """Returns sorted list of all table names in *database*."""
         return sorted(self._call("get_all_tables", database))
 
     def get_table(self, database: str, table: str) -> dict[str, Any]:
-        """
-        Returns a flat dict of table metadata with sanitised parameters.
-        Keys: name, database, table_type, columns, partition_keys,
-              parameters, location, input_format, output_format, serde,
-              num_files, num_rows, total_size.
-        """
         tbl = self._call("get_table", database, table)
         sd = tbl.sd
         raw_params: dict[str, str] = dict(tbl.parameters or {})
@@ -184,6 +143,7 @@ class HMSClient:
             output_format = sd.outputFormat or ""
             if sd.serdeInfo:
                 serde = sd.serdeInfo.serializationLib or ""
+
         cols = [_field_to_dict(c) for c in (sd.cols if sd else [])]
         part_keys = [_field_to_dict(k) for k in (tbl.partitionKeys or [])]
 
@@ -203,21 +163,11 @@ class HMSClient:
             "total_size": raw_params.get("totalSize", "-1"),
         }
 
-    def get_partition_names(
-        self, database: str, table: str, max_parts: int = 20
-    ) -> list[str]:
-        """
-        Returns up to *max_parts* partition name strings.
-        Always capped — never calls get_all_partitions().
-        """
-        cap = min(max_parts, 20)  # hard safety ceiling
+    def get_partition_names(self, database: str, table: str, max_parts: int = 20) -> list[str]:
+        cap = min(max_parts, 20)
         return self._call("get_partition_names", database, table, cap)
 
     def get_table_stats(self, database: str, table: str) -> dict[str, Any]:
-        """
-        Returns num_rows, total_size, num_files from table parameters.
-        stats_available is False when num_rows is -1 or absent.
-        """
         tbl = self._call("get_table", database, table)
         params: dict[str, str] = dict(tbl.parameters or {})
         num_rows = params.get("numRows", "-1")
@@ -234,14 +184,7 @@ class HMSClient:
             "last_modified": last_modified,
         }
 
-    def search_tables(
-        self, keyword: str, database: str | None = None
-    ) -> list[dict[str, str]]:
-        """
-        Case-insensitive substring search across table names and column names.
-        Caps at 50 tables per database for column-level scanning.
-        Returns up to 20 matches total.
-        """
+    def search_tables(self, keyword: str, database: str | None = None) -> list[dict[str, str]]:
         kw = keyword.lower()
         databases = [database] if database else self.get_all_databases()
         results: list[dict[str, str]] = []
@@ -258,14 +201,10 @@ class HMSClient:
                 if len(results) >= 20:
                     break
 
-                # Table name match — cheap, always check
                 if kw in tbl_name.lower():
-                    results.append(
-                        {"database": db, "table": tbl_name, "match_reason": "table name"}
-                    )
+                    results.append({"database": db, "table": tbl_name, "match_reason": "table name"})
                     continue
 
-                # Column name match — cap heavy scan at _SEARCH_TABLE_CAP per db
                 scanned = sum(1 for r in results if r["database"] == db)
                 if scanned >= _SEARCH_TABLE_CAP:
                     continue
@@ -273,54 +212,44 @@ class HMSClient:
                     tbl_obj = self._call("get_table", db, tbl_name)
                     sd = tbl_obj.sd
                     col_names = [c.name.lower() for c in (sd.cols if sd else [])]
-                    part_key_names = [
-                        k.name.lower() for k in (tbl_obj.partitionKeys or [])
-                    ]
-                    matched_col = next(
-                        (c for c in col_names + part_key_names if kw in c), None
-                    )
+                    part_key_names = [k.name.lower() for k in (tbl_obj.partitionKeys or [])]
+                    matched_col = next((c for c in col_names + part_key_names if kw in c), None)
                     if matched_col:
-                        results.append(
-                            {
-                                "database": db,
-                                "table": tbl_name,
-                                "match_reason": f"column '{matched_col}'",
-                            }
-                        )
+                        results.append({
+                            "database": db,
+                            "table": tbl_name,
+                            "match_reason": f"column '{matched_col}'",
+                        })
                 except Exception:
                     continue
 
         return results
 
     def get_table_ddl(self, database: str, table: str) -> str:
-        """
-        Reconstructs a CREATE TABLE statement from HMS metadata.
-        Clearly labelled as reconstructed — not SHOW CREATE TABLE output.
-        """
         tbl = self._call("get_table", database, table)
         sd = tbl.sd
         params: dict[str, str] = _sanitise_params(dict(tbl.parameters or {}))
 
         lines: list[str] = [
-            "-- Reconstructed DDL (from HMS metadata — not original source DDL)",
+            "-- Reconstructed DDL (from HMS metadata - not original source DDL)",
             f"CREATE {'EXTERNAL ' if tbl.tableType == 'EXTERNAL_TABLE' else ''}TABLE `{database}`.`{tbl.tableName}` (",
         ]
 
-        # Columns
         cols = list(sd.cols if sd else [])
-        all_fields = [f"`{c.name}` {c.type}{('  -- ' + c.comment) if c.comment else ''}" for c in cols]
+        all_fields = [
+            f"`{c.name}` {c.type}{('  -- ' + c.comment) if c.comment else ''}"
+            for c in cols
+        ]
         for i, field_line in enumerate(all_fields):
             comma = "," if i < len(all_fields) - 1 else ""
             lines.append(f"  {field_line}{comma}")
         lines.append(")")
 
-        # Partition keys
         pkeys = list(tbl.partitionKeys or [])
         if pkeys:
             pk_defs = ", ".join(f"`{k.name}` {k.type}" for k in pkeys)
             lines.append(f"PARTITIONED BY ({pk_defs})")
 
-        # Storage format
         if sd:
             fmt = _friendly_format(sd.inputFormat or "")
             if fmt in ("ORC", "Parquet", "Avro", "RCFile", "SequenceFile"):
@@ -335,7 +264,6 @@ class HMSClient:
             if sd.location:
                 lines.append(f"LOCATION '{sd.location}'")
 
-        # TBLPROPERTIES (non-empty, skip internal HMS stats keys)
         _internal_skip = {
             "numFiles", "numRows", "rawDataSize", "totalSize",
             "numFilesErasureCoded", "transient_lastDdlTime",

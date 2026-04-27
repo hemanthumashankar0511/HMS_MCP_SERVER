@@ -1,12 +1,3 @@
-"""
-HiveMind Phase 1 — discovery tool handlers.
-
-Each handler:
-- Accepts an HMSClient instance plus tool-specific arguments
-- Returns a plain-text string formatted for display in Cursor Agent
-- Never raises — all errors are caught and returned as readable messages
-"""
-
 from __future__ import annotations
 
 import logging
@@ -17,12 +8,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _fmt_bytes(raw: str) -> str:
-    """Convert a byte-count string to a human-readable size."""
     try:
         n = int(raw)
     except (ValueError, TypeError):
@@ -62,12 +49,7 @@ def _short_type(table_type: str) -> str:
     }.get(table_type, table_type)
 
 
-# ---------------------------------------------------------------------------
-# Tool handlers
-# ---------------------------------------------------------------------------
-
 async def handle_list_databases(client: "HMSClient") -> str:
-    """Lists all databases in HMS."""
     try:
         dbs = client.get_all_databases()
     except Exception as exc:
@@ -77,7 +59,7 @@ async def handle_list_databases(client: "HMSClient") -> str:
     if not dbs:
         return "No databases found in HMS."
 
-    lines = [f"Databases in Hive Metastore  ({len(dbs)} total)", "=" * 40]
+    lines = [f"Databases in Hive Metastore ({len(dbs)} total)", "=" * 40]
     for db in dbs:
         lines.append(f"  {db}")
     lines.append("")
@@ -86,7 +68,6 @@ async def handle_list_databases(client: "HMSClient") -> str:
 
 
 async def handle_list_tables(client: "HMSClient", database: str) -> str:
-    """Lists all tables in a database."""
     try:
         tables = client.get_all_tables(database)
     except Exception as exc:
@@ -96,7 +77,7 @@ async def handle_list_tables(client: "HMSClient", database: str) -> str:
     if not tables:
         return f"No tables found in database '{database}'."
 
-    lines = [f"Tables in '{database}'  ({len(tables)} total)", "=" * 40]
+    lines = [f"Tables in '{database}' ({len(tables)} total)", "=" * 40]
     for t in tables:
         lines.append(f"  {t}")
     lines.append("")
@@ -107,7 +88,6 @@ async def handle_list_tables(client: "HMSClient", database: str) -> str:
 async def handle_search_tables(
     client: "HMSClient", keyword: str, database: str | None = None
 ) -> str:
-    """Search for tables by keyword across table names and column names."""
     try:
         results = client.search_tables(keyword, database)
     except Exception as exc:
@@ -117,14 +97,13 @@ async def handle_search_tables(
     scope = f"database '{database}'" if database else "all databases"
 
     if not results:
-        searched = f"Searched {scope}."
         return (
-            f"No tables found matching '{keyword}'.\n{searched}\n"
+            f"No tables found matching '{keyword}'.\nSearched {scope}.\n"
             "Try a shorter keyword or check the spelling."
         )
 
     lines = [
-        f"Search results for '{keyword}' in {scope}  ({len(results)} match(es))",
+        f"Search results for '{keyword}' in {scope} ({len(results)} match(es))",
         "=" * 55,
         f"{'Database':<20} {'Table':<30} Match reason",
         "-" * 65,
@@ -140,7 +119,6 @@ async def handle_search_tables(
 async def handle_get_table_schema(
     client: "HMSClient", database: str, table: str
 ) -> str:
-    """Returns full schema: columns, partition keys, storage format, table type."""
     try:
         info = client.get_table(database, table)
     except Exception as exc:
@@ -151,7 +129,7 @@ async def handle_get_table_schema(
     tbl_type = _short_type(info["table_type"])
     num_rows = info.get("num_rows", "-1")
     stats_warn = (
-        "\n  [!] Statistics missing — run: ANALYZE TABLE "
+        "\n  [!] Statistics missing - run: ANALYZE TABLE "
         f"{database}.{table} COMPUTE STATISTICS\n"
         if num_rows in ("-1", "", None) or int(num_rows) < 0
         else ""
@@ -193,7 +171,6 @@ async def handle_get_table_schema(
 async def handle_get_table_stats(
     client: "HMSClient", database: str, table: str
 ) -> str:
-    """Returns table statistics with a warning when they haven't been computed."""
     try:
         stats = client.get_table_stats(database, table)
     except Exception as exc:
@@ -205,7 +182,7 @@ async def handle_get_table_stats(
     if not stats["stats_available"]:
         lines.append("")
         lines.append(
-            "  [!] Statistics missing — run ANALYZE TABLE "
+            "  [!] Statistics missing - run ANALYZE TABLE "
             f"{database}.{table} COMPUTE STATISTICS for accurate analysis."
         )
         lines.append("")
@@ -224,11 +201,10 @@ async def handle_get_table_stats(
 async def handle_get_partitions(
     client: "HMSClient", database: str, table: str
 ) -> str:
-    """Returns partition key structure and up to 20 sample partition values."""
     try:
         info = client.get_table(database, table)
     except Exception as exc:
-        logger.exception("get_partitions failed (table fetch) for %s.%s", database, table)
+        logger.exception("get_partitions failed for %s.%s", database, table)
         return f"Error fetching table metadata for '{database}.{table}': {exc}"
 
     part_keys = info.get("partition_keys", [])
@@ -250,7 +226,7 @@ async def handle_get_partitions(
 
     lines.append("")
     if part_names:
-        lines.append(f"Showing {len(part_names)} most recent partitions (sample — not the full list):")
+        lines.append(f"Showing {len(part_names)} sample partitions:")
         for p in part_names:
             lines.append(f"  {p}")
     else:
@@ -262,7 +238,6 @@ async def handle_get_partitions(
 async def handle_get_table_ddl(
     client: "HMSClient", database: str, table: str
 ) -> str:
-    """Returns a reconstructed CREATE TABLE statement from HMS metadata."""
     try:
         ddl = client.get_table_ddl(database, table)
     except Exception as exc:
