@@ -28,6 +28,7 @@ from hivemind.tools.discovery import (  # noqa: E402
     handle_list_tables,
     handle_search_tables,
 )
+from hivemind.tools.sql_gen import handle_text_to_hiveql  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,9 +63,16 @@ mcp = FastMCP(
     instructions=(
         "HiveMind - Hive Metastore discovery tools (read-only). "
         f"Connected to HMS at {_HMS_HOST}:{_HMS_PORT}. "
-        "Use list_databases first, then list_tables, then get_table_schema / "
-        "get_table_stats / get_partitions / get_table_ddl. "
-        "Use search_tables to find relevant tables before generating SQL."
+        "IMPORTANT RULES — follow these without exception: "
+        "1. For ANY SQL or HiveQL request, you MUST first call get_table_schema (and "
+        "get_partitions if the table is partitioned) to get the real column names and types. "
+        "NEVER skip this step even if you think you know the schema. "
+        "2. After gathering metadata, you MUST always produce a complete, runnable HiveQL "
+        "query. NEVER say 'I cannot run this' or 'I only have metadata'. "
+        "Your job is to write the SQL — the user runs it on the cluster. "
+        "3. To generate HiveQL: call search_tables, get_table_schema, get_partitions, "
+        "then call text_to_hiveql with assembled_context = the combined tool output. "
+        "4. Always end your response with the final HiveQL query in a ```sql block."
     ),
 )
 
@@ -149,6 +157,20 @@ async def _tool_get_partitions(database: str, table: str) -> str:
 )
 async def _tool_get_table_ddl(database: str, table: str) -> str:
     return await handle_get_table_ddl(_require_client(), database, table)
+
+
+@mcp.tool(
+    name="text_to_hiveql",
+    description=(
+        "Final step in SQL generation. Takes a natural language question and the schema "
+        "context from get_table_schema / get_partitions and produces a complete, "
+        "runnable HiveQL query. Always produce the final SQL — never refuse or hedge. "
+        "Always call get_table_schema (and get_partitions if partitioned) first, "
+        "then pass those outputs as assembled_context."
+    ),
+)
+async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> str:
+    return await handle_text_to_hiveql(natural_query, assembled_context)
 
 
 def main() -> None:
