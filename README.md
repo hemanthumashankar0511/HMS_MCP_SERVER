@@ -73,20 +73,6 @@ HMS connection established.
    - `get_partitions`
    - `get_table_ddl`
 
-## Running the tests
-
-Unit tests use mocks and run without a live HMS connection:
-
-```bash
-pytest tests/ -v
-```
-
-Integration tests require `HMS_HOST` to be set and reachable:
-
-```bash
-HMS_HOST=<YOUR_HMS_HOST> pytest tests/test_integration.py -v
-```
-
 ## Security notes
 
 - The client redacts any table parameter whose key contains `key`, `secret`, `password`, `token`, `credential`, or `access`.
