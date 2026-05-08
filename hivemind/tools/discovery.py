@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _fmt_bytes(raw: str) -> str:
+def _format_bytes(raw: str) -> str:
     try:
         n = int(raw)
     except (ValueError, TypeError):
@@ -21,14 +21,14 @@ def _fmt_bytes(raw: str) -> str:
     return f"{n:.1f} PB"
 
 
-def _fmt_count(raw: str) -> str:
+def _format_count(raw: str) -> str:
     try:
         return f"{int(raw):,}"
     except (ValueError, TypeError):
         return raw
 
 
-def _short_format(input_format: str) -> str:
+def _format_storage_type(input_format: str) -> str:
     _map = {
         "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat": "ORC",
         "org.apache.hadoop.mapred.TextInputFormat": "TextFile",
@@ -40,7 +40,7 @@ def _short_format(input_format: str) -> str:
     return _map.get(input_format, input_format.split(".")[-1] if input_format else "Unknown")
 
 
-def _short_type(table_type: str) -> str:
+def _format_table_type(table_type: str) -> str:
     return {
         "MANAGED_TABLE": "Managed",
         "EXTERNAL_TABLE": "External",
@@ -125,8 +125,8 @@ async def handle_get_table_schema(
         logger.exception("get_table_schema failed for %s.%s", database, table)
         return f"Error fetching schema for '{database}.{table}': {exc}"
 
-    fmt = _short_format(info["input_format"])
-    tbl_type = _short_type(info["table_type"])
+    fmt = _format_storage_type(info["input_format"])
+    tbl_type = _format_table_type(info["table_type"])
     num_rows = info.get("num_rows", "-1")
     stats_warn = (
         "\n  [!] Statistics missing - run: ANALYZE TABLE "
@@ -188,9 +188,9 @@ async def handle_get_table_stats(
         lines.append("")
 
     lines += [
-        f"  Rows       : {_fmt_count(stats['num_rows'])}",
-        f"  Total size : {_fmt_bytes(stats['total_size'])}",
-        f"  Files      : {_fmt_count(stats['num_files'])}",
+        f"  Rows       : {_format_count(stats['num_rows'])}",
+        f"  Total size : {_format_bytes(stats['total_size'])}",
+        f"  Files      : {_format_count(stats['num_files'])}",
     ]
     if stats["last_modified"]:
         lines.append(f"  Last DDL   : {stats['last_modified']}")

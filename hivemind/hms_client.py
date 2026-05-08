@@ -49,7 +49,7 @@ def _friendly_format(class_name: str) -> str:
     return _FORMAT_ALIASES.get(class_name, class_name.split(".")[-1] if class_name else "Unknown")
 
 
-def _sanitise_params(params: dict[str, str]) -> dict[str, str]:
+def _sanitize_params(params: dict[str, str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in params.items():
         if k in _REDACT_EXACT or any(p.search(k) for p in _REDACT_PATTERNS):
@@ -128,10 +128,46 @@ class HMSClient:
         return sorted(self._call("get_all_tables", database))
 
     def get_table(self, database: str, table: str) -> dict[str, Any]:
-        tbl = self._call("get_table", database, table)
+        """
+        Fetch table metadata from HMS.
+        
+        Uses request-based API with client capabilities when available to support
+        ACID transactional (insert-only) tables. Falls back to older simple API for
+        compatibility with pre-3.0 HMS.
+        
+        Note: Disabling capability checks server-wide (metastore.client.capability.check=false)
+        is possible but inferior to fixing the client to declare proper capabilities.
+        """
+        # Try request-based API with full capabilities (HMS 3.0+, supports ACID tables)
+        try:
+            from hive_metastore import ttypes
+            req = ttypes.GetTableRequest(
+                dbName=database,
+                tblName=table,
+                capabilities=ttypes.ClientCapabilities(
+                    values=[ttypes.ClientCapability.INSERT_ONLY_TABLES]
+                ),
+            )
+            result = self._call("get_table_req", req)
+            tbl = result.table
+        except (AttributeError, Exception) as exc:
+            # Fallback 1: try request without capabilities (some HMS 3.x configs)
+            try:
+                from hive_metastore import ttypes
+                req = ttypes.GetTableRequest(dbName=database, tblName=table)
+                result = self._call("get_table_req", req)
+                tbl = result.table
+            except (AttributeError, Exception):
+                # Fallback 2: use old simple API (HMS 2.x and earlier)
+                try:
+                    tbl = self._call("get_table", database, table)
+                except Exception:
+                    # Re-raise original error from capability-aware attempt for better diagnostics
+                    raise exc
+        
         sd = tbl.sd
         raw_params: dict[str, str] = dict(tbl.parameters or {})
-        clean_params = _sanitise_params(raw_params)
+        clean_params = _sanitize_params(raw_params)
 
         location = ""
         input_format = ""
@@ -168,8 +204,9 @@ class HMSClient:
         return self._call("get_partition_names", database, table, cap)
 
     def get_table_stats(self, database: str, table: str) -> dict[str, Any]:
-        tbl = self._call("get_table", database, table)
-        params: dict[str, str] = dict(tbl.parameters or {})
+        """Fetch table statistics. Uses capability-aware get_table internally."""
+        info = self.get_table(database, table)
+        params: dict[str, str] = info["parameters"]
         num_rows = params.get("numRows", "-1")
         total_size = params.get("totalSize", "-1")
         num_files = params.get("numFiles", "-1")
@@ -183,6 +220,31 @@ class HMSClient:
             "stats_available": stats_available,
             "last_modified": last_modified,
         }
+
+    def _get_table_raw(self, database: str, table: str) -> Any:
+        """
+        Internal: fetch raw Thrift table object with capabilities.
+        Used by get_table_ddl which needs the raw Thrift structure.
+        """
+        try:
+            from hive_metastore import ttypes
+            req = ttypes.GetTableRequest(
+                dbName=database,
+                tblName=table,
+                capabilities=ttypes.ClientCapabilities(
+                    values=[ttypes.ClientCapability.INSERT_ONLY_TABLES]
+                ),
+            )
+            result = self._call("get_table_req", req)
+            return result.table
+        except (AttributeError, Exception):
+            try:
+                from hive_metastore import ttypes
+                req = ttypes.GetTableRequest(dbName=database, tblName=table)
+                result = self._call("get_table_req", req)
+                return result.table
+            except (AttributeError, Exception):
+                return self._call("get_table", database, table)
 
     def search_tables(self, keyword: str, database: str | None = None) -> list[dict[str, str]]:
         kw = keyword.lower()
@@ -209,7 +271,8 @@ class HMSClient:
                 if scanned >= _SEARCH_TABLE_CAP:
                     continue
                 try:
-                    tbl_obj = self._call("get_table", db, tbl_name)
+                    # Use capability-aware fetch to support ACID tables during search
+                    tbl_obj = self._get_table_raw(db, tbl_name)
                     sd = tbl_obj.sd
                     col_names = [c.name.lower() for c in (sd.cols if sd else [])]
                     part_key_names = [k.name.lower() for k in (tbl_obj.partitionKeys or [])]
@@ -226,18 +289,19 @@ class HMSClient:
         return results
 
     def get_table_ddl(self, database: str, table: str) -> str:
-        tbl = self._call("get_table", database, table)
+        """Reconstruct CREATE TABLE DDL. Uses capability-aware fetch for ACID support."""
+        tbl = self._get_table_raw(database, table)
         sd = tbl.sd
-        params: dict[str, str] = _sanitise_params(dict(tbl.parameters or {}))
+        params: dict[str, str] = _sanitize_params(dict(tbl.parameters or {}))
 
         lines: list[str] = [
             "-- Reconstructed DDL (from HMS metadata - not original source DDL)",
-            f"CREATE {'EXTERNAL ' if tbl.tableType == 'EXTERNAL_TABLE' else ''}TABLE `{database}`.`{tbl.tableName}` (",
+            f"CREATE {'EXTERNAL ' if tbl.tableType == 'EXTERNAL_TABLE' else ''}TABLE {database}.{tbl.tableName} (",
         ]
 
         cols = list(sd.cols if sd else [])
         all_fields = [
-            f"`{c.name}` {c.type}{('  -- ' + c.comment) if c.comment else ''}"
+            f"{c.name} {c.type}{('  -- ' + c.comment) if c.comment else ''}"
             for c in cols
         ]
         for i, field_line in enumerate(all_fields):
@@ -247,7 +311,7 @@ class HMSClient:
 
         pkeys = list(tbl.partitionKeys or [])
         if pkeys:
-            pk_defs = ", ".join(f"`{k.name}` {k.type}" for k in pkeys)
+            pk_defs = ", ".join(f"{k.name} {k.type}" for k in pkeys)
             lines.append(f"PARTITIONED BY ({pk_defs})")
 
         if sd:
