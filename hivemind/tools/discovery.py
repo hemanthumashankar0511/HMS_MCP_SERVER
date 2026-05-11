@@ -23,6 +23,20 @@ def _is_missing_stat(raw: str | None) -> bool:
         return text.lower() in {"unknown", "na"}
 
 
+def _stat_int(raw: str | None) -> int:
+    """Parse HMS numRows/numFiles/totalSize-style string; -1 means unknown."""
+    if raw is None:
+        return -1
+    text = str(raw).strip().replace(",", "")
+    if text in {"", "-1", "N/A"}:
+        return -1
+    try:
+        n = int(float(text))
+        return n if n >= 0 else -1
+    except (ValueError, TypeError):
+        return -1
+
+
 def _format_bytes(raw: str) -> str:
     if _is_missing_stat(raw):
         return "unknown"
@@ -45,12 +59,6 @@ def _format_count(raw: str) -> str:
         return f"{int(raw):,}"
     except (ValueError, TypeError):
         return raw
-
-
-def _format_storage_type(input_format: str) -> str:
-    return _FORMAT_ALIASES.get(
-        input_format, input_format.split(".")[-1] if input_format else "Unknown"
-    )
 
 
 def _format_table_type(table_type: str) -> str:
@@ -139,7 +147,7 @@ async def handle_get_table_schema(
         logger.exception("get_table_schema failed for %s.%s", database, table)
         return f"Error fetching schema for '{database}.{table}': {exc}"
 
-    fmt = _format_storage_type(info["input_format"])
+    fmt = _FORMAT_ALIASES.get(info["input_format"], info["input_format"].split(".")[-1] if info["input_format"] else "Unknown")
     tbl_type = _format_table_type(info["table_type"])
 
     lines = [
@@ -194,6 +202,59 @@ async def handle_get_table_stats(
     if stats["last_modified"]:
         lines.append(f"  Last DDL   : {stats['last_modified']}")
 
+    # Table-level HMS stats are often absent for partitioned tables; roll up sampled partitions.
+    if not stats["stats_available"]:
+        try:
+            info = client.get_table(database, table)
+        except Exception as exc:
+            logger.debug("get_table for partition rollup failed: %s", exc)
+            return "\n".join(lines)
+        if info.get("partition_keys"):
+            lines.append("")
+            lines.append(
+                "Table-level numRows absent in HMS. Sample partition stats (same cap as get_partitions):"
+            )
+            try:
+                part_names = client.get_partition_names(database, table, max_parts=20)
+            except Exception as exc:
+                lines.append(f"  (could not list partitions: {exc})")
+                return "\n".join(lines)
+            sum_rows = 0
+            parts_with_rows = 0
+            detail: list[str] = []
+            for pn in part_names:
+                try:
+                    pst = client.get_partition_basic_stats(database, table, pn)
+                except Exception as exc:
+                    detail.append(f"  {pn} (metadata error: {exc})")
+                    continue
+                nr = pst["num_rows"]
+                nf = pst["num_files"]
+                sz = pst["total_size"]
+                rows_i = _stat_int(nr)
+                if rows_i >= 0:
+                    sum_rows += rows_i
+                    parts_with_rows += 1
+                detail.append(
+                    f"  {pn}  rows={nr}  files={nf}  size={sz}"
+                    if nr != "-1" or nf != "-1" or sz != "-1"
+                    else f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)"
+                )
+            lines.extend(detail)
+            suffix = ""
+            if len(part_names) >= 20:
+                suffix = " Partial sum — up to 20 partitions sampled; analyze all partitions separately if needed."
+            if parts_with_rows:
+                lines.append("")
+                lines.append(
+                    f"  Sum(rows) over partitions with usable numRows ({parts_with_rows} partition(s)): {sum_rows:,}{suffix}"
+                )
+            elif part_names:
+                lines.append("")
+                lines.append(
+                    "  No partition-level numRows in HMS sample. Run ANALYZE TABLE ... PARTITION(...) COMPUTE STATISTICS."
+                )
+
     return "\n".join(lines)
 
 
@@ -226,9 +287,28 @@ async def handle_get_partitions(
 
     lines.append("")
     if part_names:
-        lines.append(f"Showing {len(part_names)} sample partitions:")
+        lines.append(
+            f"Showing {len(part_names)} sample partition(s); HMS BASIC_STATS per partition:"
+        )
         for p in part_names:
             lines.append(f"  {p}")
+            try:
+                pst = client.get_partition_basic_stats(database, table, p)
+            except Exception as exc:
+                lines.append(f"    (could not load stats: {exc})")
+                continue
+            nr, nf, ts = pst["num_rows"], pst["num_files"], pst["total_size"]
+            if nr == "-1" and nf == "-1" and ts == "-1":
+                lines.append(
+                    "    rows=unknown  files=unknown  size=unknown  "
+                    "(run ANALYZE TABLE ... PARTITION (...) COMPUTE STATISTICS)"
+                )
+            else:
+                lines.append(
+                    f"    rows={_format_count(nr)}  "
+                    f"files={_format_count(nf)}  "
+                    f"size={_format_bytes(ts)}"
+                )
     else:
         lines.append("No partition data found (table may be empty or not yet populated).")
 

@@ -52,14 +52,6 @@ def _friendly_format(class_name: str) -> str:
     return _FORMAT_ALIASES.get(class_name, class_name.split(".")[-1] if class_name else "Unknown")
 
 
-def _safe_int(value: Any, default: int = -1) -> int:
-    """Parse value as int, returning default on failure instead of raising."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _sanitize_params(params: dict[str, str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in params.items():
@@ -231,15 +223,32 @@ class HMSClient:
         cap = min(max_parts, 20)
         return self._call("get_partition_names", database, table, cap)
 
+    def get_partition_basic_stats(self, database: str, table: str, partition_name: str) -> dict[str, str]:
+        """
+        BASIC_STATS persisted on a partition row in HMS (same numRows/totalSize/numFiles keys as table level).
+
+        Use when partition-level ANALYZE was run without table rollup, or alongside table-level totals.
+        """
+        part = self._call("get_partition_by_name", database, table, partition_name)
+        params = dict(part.parameters or {})
+        return {
+            "num_rows": params.get("numRows", "-1"),
+            "num_files": params.get("numFiles", "-1"),
+            "total_size": params.get("totalSize", "-1"),
+        }
+
     def get_table_stats(self, database: str, table: str) -> dict[str, Any]:
         """Fetch table statistics. Uses capability-aware get_table internally."""
         info = self.get_table(database, table)
+        num_rows = info.get("num_rows", "-1")
+        total_size = info.get("total_size", "-1")
+        num_files = info.get("num_files", "-1")
         params: dict[str, str] = info["parameters"]
-        num_rows = params.get("numRows", "-1")
-        total_size = params.get("totalSize", "-1")
-        num_files = params.get("numFiles", "-1")
         last_modified = params.get("transient_lastDdlTime", "")
-        stats_available = _safe_int(num_rows) >= 0
+        try:
+            stats_available = int(num_rows) >= 0
+        except (TypeError, ValueError):
+            stats_available = False
 
         return {
             "num_rows": num_rows,
