@@ -3,25 +3,44 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from hivemind.hms_client import _FORMAT_ALIASES
+
 if TYPE_CHECKING:
     from hivemind.hms_client import HMSClient
 
 logger = logging.getLogger(__name__)
 
 
+def _is_missing_stat(raw: str | None) -> bool:
+    if raw in (None, "", "N/A"):
+        return True
+    text = str(raw).strip()
+    if not text:
+        return True
+    try:
+        return int(float(text)) < 0
+    except (ValueError, TypeError):
+        return text.lower() in {"unknown", "na"}
+
+
 def _format_bytes(raw: str) -> str:
+    if _is_missing_stat(raw):
+        return "unknown"
     try:
         n = int(raw)
     except (ValueError, TypeError):
         return raw
+    size = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024  # type: ignore[assignment]
-    return f"{n:.1f} PB"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 def _format_count(raw: str) -> str:
+    if _is_missing_stat(raw):
+        return "unknown"
     try:
         return f"{int(raw):,}"
     except (ValueError, TypeError):
@@ -29,15 +48,9 @@ def _format_count(raw: str) -> str:
 
 
 def _format_storage_type(input_format: str) -> str:
-    _map = {
-        "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat": "ORC",
-        "org.apache.hadoop.mapred.TextInputFormat": "TextFile",
-        "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat": "Parquet",
-        "org.apache.hadoop.mapred.SequenceFileInputFormat": "SequenceFile",
-        "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat": "Avro",
-        "org.apache.hadoop.hive.ql.io.RCFileInputFormat": "RCFile",
-    }
-    return _map.get(input_format, input_format.split(".")[-1] if input_format else "Unknown")
+    return _FORMAT_ALIASES.get(
+        input_format, input_format.split(".")[-1] if input_format else "Unknown"
+    )
 
 
 def _format_table_type(table_type: str) -> str:
@@ -69,6 +82,7 @@ async def handle_list_databases(client: "HMSClient") -> str:
 
 async def handle_list_tables(client: "HMSClient", database: str) -> str:
     try:
+        # TODO: add output cap; very large databases can return thousands of table names
         tables = client.get_all_tables(database)
     except Exception as exc:
         logger.exception("list_tables failed for %s", database)
@@ -127,13 +141,6 @@ async def handle_get_table_schema(
 
     fmt = _format_storage_type(info["input_format"])
     tbl_type = _format_table_type(info["table_type"])
-    num_rows = info.get("num_rows", "-1")
-    stats_warn = (
-        "\n  [!] Statistics missing - run: ANALYZE TABLE "
-        f"{database}.{table} COMPUTE STATISTICS\n"
-        if num_rows in ("-1", "", None) or int(num_rows) < 0
-        else ""
-    )
 
     lines = [
         f"Schema: {database}.{table}",
@@ -141,7 +148,6 @@ async def handle_get_table_schema(
         f"  Type    : {tbl_type}",
         f"  Format  : {fmt}",
         f"  Location: {info['location']}",
-        stats_warn,
         "Columns:",
         f"  {'Name':<30} {'Type':<20} Comment",
         "  " + "-" * 65,
@@ -161,6 +167,7 @@ async def handle_get_table_schema(
 
     if info["parameters"]:
         lines.append("")
+        # TODO: add output cap; tables with many custom properties can produce very long output
         lines.append("Table Properties:")
         for k, v in sorted(info["parameters"].items()):
             lines.append(f"  {k} = {v}")
@@ -178,14 +185,6 @@ async def handle_get_table_stats(
         return f"Error fetching stats for '{database}.{table}': {exc}"
 
     lines = [f"Statistics: {database}.{table}", "=" * 50]
-
-    if not stats["stats_available"]:
-        lines.append("")
-        lines.append(
-            "  [!] Statistics missing - run ANALYZE TABLE "
-            f"{database}.{table} COMPUTE STATISTICS for accurate analysis."
-        )
-        lines.append("")
 
     lines += [
         f"  Rows       : {_format_count(stats['num_rows'])}",
@@ -219,6 +218,7 @@ async def handle_get_partitions(
         lines.append(f"  {pk['name']:<25} {pk['type']}")
 
     try:
+        # TODO: add output cap; tables with many partitions can return unbounded partition lists
         part_names = client.get_partition_names(database, table, max_parts=20)
     except Exception as exc:
         lines.append(f"\nCould not fetch partition values: {exc}")

@@ -9,6 +9,7 @@ from typing import Any
 from thrift.protocol import TBinaryProtocol
 from thrift.transport import TSocket, TTransport
 from thrift.transport.TTransport import TTransportException
+from thrift.Thrift import TApplicationException
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ _REDACT_PATTERNS: tuple[re.Pattern, ...] = tuple(
     for p in (r"key", r"secret", r"password", r"token", r"credential", r"access")
 )
 
+# Canonical mapping from Hadoop I/O class names to human-readable storage format names.
+# Used by both hms_client and discovery to avoid duplication.
 _FORMAT_ALIASES: dict[str, str] = {
     "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat": "ORC",
     "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat": "ORC",
@@ -47,6 +50,14 @@ _SEARCH_TABLE_CAP = 50
 
 def _friendly_format(class_name: str) -> str:
     return _FORMAT_ALIASES.get(class_name, class_name.split(".")[-1] if class_name else "Unknown")
+
+
+def _safe_int(value: Any, default: int = -1) -> int:
+    """Parse value as int, returning default on failure instead of raising."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _sanitize_params(params: dict[str, str]) -> dict[str, str]:
@@ -90,7 +101,7 @@ class HMSClient:
         if self._transport and self._transport.isOpen():
             try:
                 self._transport.close()
-            except Exception:
+            except TTransportException:
                 pass
 
         sock = TSocket.TSocket(self._host, self._port)
@@ -127,44 +138,55 @@ class HMSClient:
     def get_all_tables(self, database: str) -> list[str]:
         return sorted(self._call("get_all_tables", database))
 
-    def get_table(self, database: str, table: str) -> dict[str, Any]:
+    def _fetch_table_with_fallbacks(self, db: str, table: str) -> Any:
         """
-        Fetch table metadata from HMS.
-        
-        Uses request-based API with client capabilities when available to support
-        ACID transactional (insert-only) tables. Falls back to older simple API for
-        compatibility with pre-3.0 HMS.
-        
-        Note: Disabling capability checks server-wide (metastore.client.capability.check=false)
-        is possible but inferior to fixing the client to declare proper capabilities.
+        Fetch the raw Thrift Table object using the most capable API available.
+
+        Tries three tiers in order:
+          1. get_table_req with INSERT_ONLY_TABLES capability (HMS 3.0+, full ACID support)
+          2. get_table_req without capabilities (some HMS 3.x configurations)
+          3. get_table simple API (HMS 2.x and earlier)
+
+        Raises the original exception from tier 1 if all fallbacks fail, to preserve
+        the most informative diagnostic.
         """
-        # Try request-based API with full capabilities (HMS 3.0+, supports ACID tables)
+        from hive_metastore import ttypes  # noqa: PLC0415
+
+        # Tier 1: capability-aware request (HMS 3.0+)
         try:
-            from hive_metastore import ttypes
             req = ttypes.GetTableRequest(
-                dbName=database,
+                dbName=db,
                 tblName=table,
                 capabilities=ttypes.ClientCapabilities(
                     values=[ttypes.ClientCapability.INSERT_ONLY_TABLES]
                 ),
             )
             result = self._call("get_table_req", req)
-            tbl = result.table
-        except (AttributeError, Exception) as exc:
-            # Fallback 1: try request without capabilities (some HMS 3.x configs)
-            try:
-                from hive_metastore import ttypes
-                req = ttypes.GetTableRequest(dbName=database, tblName=table)
-                result = self._call("get_table_req", req)
-                tbl = result.table
-            except (AttributeError, Exception):
-                # Fallback 2: use old simple API (HMS 2.x and earlier)
-                try:
-                    tbl = self._call("get_table", database, table)
-                except Exception:
-                    # Re-raise original error from capability-aware attempt for better diagnostics
-                    raise exc
-        
+            return result.table
+        except (AttributeError, TApplicationException):
+            pass  # intentional fallback chain
+
+        # Tier 2: request without capabilities (some HMS 3.x configs)
+        try:
+            req = ttypes.GetTableRequest(dbName=db, tblName=table)
+            result = self._call("get_table_req", req)
+            return result.table
+        except (AttributeError, TApplicationException):
+            pass
+
+        # Tier 3: legacy simple API (HMS 2.x)
+        return self._call("get_table", db, table)
+
+    def get_table(self, database: str, table: str) -> dict[str, Any]:
+        """
+        Fetch normalized table metadata from HMS.
+
+        Uses a 3-tier HMS version-compatibility fallback: capability-aware get_table_req
+        (HMS 3.0+), plain get_table_req (some 3.x configs), then the legacy get_table
+        API (HMS 2.x). Returns a dict with columns, partition_keys, storage info, and
+        sanitized table properties (credentials are redacted).
+        """
+        tbl = self._fetch_table_with_fallbacks(database, table)
         sd = tbl.sd
         raw_params: dict[str, str] = dict(tbl.parameters or {})
         clean_params = _sanitize_params(raw_params)
@@ -200,6 +222,12 @@ class HMSClient:
         }
 
     def get_partition_names(self, database: str, table: str, max_parts: int = 20) -> list[str]:
+        """
+        Return up to max_parts partition name strings for the given table.
+
+        Partition names are returned in HMS-native format (e.g. 'year=2024/month=01').
+        The cap is enforced at min(max_parts, 20) to avoid overwhelming the caller.
+        """
         cap = min(max_parts, 20)
         return self._call("get_partition_names", database, table, cap)
 
@@ -211,7 +239,7 @@ class HMSClient:
         total_size = params.get("totalSize", "-1")
         num_files = params.get("numFiles", "-1")
         last_modified = params.get("transient_lastDdlTime", "")
-        stats_available = num_rows not in ("-1", "", None) and int(num_rows) >= 0
+        stats_available = _safe_int(num_rows) >= 0
 
         return {
             "num_rows": num_rows,
@@ -221,32 +249,15 @@ class HMSClient:
             "last_modified": last_modified,
         }
 
-    def _get_table_raw(self, database: str, table: str) -> Any:
-        """
-        Internal: fetch raw Thrift table object with capabilities.
-        Used by get_table_ddl which needs the raw Thrift structure.
-        """
-        try:
-            from hive_metastore import ttypes
-            req = ttypes.GetTableRequest(
-                dbName=database,
-                tblName=table,
-                capabilities=ttypes.ClientCapabilities(
-                    values=[ttypes.ClientCapability.INSERT_ONLY_TABLES]
-                ),
-            )
-            result = self._call("get_table_req", req)
-            return result.table
-        except (AttributeError, Exception):
-            try:
-                from hive_metastore import ttypes
-                req = ttypes.GetTableRequest(dbName=database, tblName=table)
-                result = self._call("get_table_req", req)
-                return result.table
-            except (AttributeError, Exception):
-                return self._call("get_table", database, table)
-
     def search_tables(self, keyword: str, database: str | None = None) -> list[dict[str, str]]:
+        """
+        Search for tables whose name or column names contain keyword.
+
+        Searches all databases unless database is specified. Name matches are cheap
+        (no Thrift fetch required); column matches incur one get_table_req call per
+        table and are capped at _SEARCH_TABLE_CAP schema fetches per database to
+        bound latency. Results are capped at 20 total matches.
+        """
         kw = keyword.lower()
         databases = [database] if database else self.get_all_databases()
         results: list[dict[str, str]] = []
@@ -267,12 +278,11 @@ class HMSClient:
                     results.append({"database": db, "table": tbl_name, "match_reason": "table name"})
                     continue
 
-                scanned = sum(1 for r in results if r["database"] == db)
-                if scanned >= _SEARCH_TABLE_CAP:
+                schema_fetches_for_db = sum(1 for r in results if r["database"] == db)
+                if schema_fetches_for_db >= _SEARCH_TABLE_CAP:
                     continue
                 try:
-                    # Use capability-aware fetch to support ACID tables during search
-                    tbl_obj = self._get_table_raw(db, tbl_name)
+                    tbl_obj = self._fetch_table_with_fallbacks(db, tbl_name)
                     sd = tbl_obj.sd
                     col_names = [c.name.lower() for c in (sd.cols if sd else [])]
                     part_key_names = [k.name.lower() for k in (tbl_obj.partitionKeys or [])]
@@ -289,13 +299,20 @@ class HMSClient:
         return results
 
     def get_table_ddl(self, database: str, table: str) -> str:
-        """Reconstruct CREATE TABLE DDL. Uses capability-aware fetch for ACID support."""
-        tbl = self._get_table_raw(database, table)
+        """
+        Reconstruct a CREATE TABLE statement from HMS metadata.
+
+        The output is derived from stored metadata and may omit properties set at
+        table creation time that HMS does not persist. Uses the capability-aware
+        fetch path to support ACID and insert-only tables.
+        """
+        tbl = self._fetch_table_with_fallbacks(database, table)
         sd = tbl.sd
         params: dict[str, str] = _sanitize_params(dict(tbl.parameters or {}))
 
         lines: list[str] = [
-            "-- Reconstructed DDL (from HMS metadata - not original source DDL)",
+            "-- Note: DDL reconstructed from Hive Metastore metadata.",
+            "-- Some properties may be normalized or omitted.",
             f"CREATE {'EXTERNAL ' if tbl.tableType == 'EXTERNAL_TABLE' else ''}TABLE {database}.{tbl.tableName} (",
         ]
 

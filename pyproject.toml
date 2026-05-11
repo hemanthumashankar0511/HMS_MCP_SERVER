@@ -1,22 +1,40 @@
 [project]
 name = "hivemind-mcp"
 version = "0.1.0"
-description = "MCP server for Apache Hive Metastore — read-only discovery tools (list DBs/tables, schema, stats, partitions, DDL) for AI agents."
+description = "MCP server for Apache Hive Metastore — read-only discovery tools for AI agents."
 readme = "README.md"
-requires-python = "==3.14.4"
-keywords = ["mcp", "hive", "hive-metastore", "hms", "thrift", "cursor", "fastmcp", "model-context-protocol"]
+requires-python = ">=3.11"
+
+keywords = [
+    "mcp",
+    "hive",
+    "hive-metastore",
+    "hms",
+    "thrift",
+    "fastmcp",
+    "model-context-protocol",
+]
+
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Database",
 ]
+
 dependencies = [
-    "fastmcp>=2.0",
-    "thrift>=0.20",
-    "python-dotenv>=1.0.0",
+    "fastmcp>=2.0,<3.0",
+    "thrift>=0.20,<1.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -26,5 +44,9 @@ hivemind-mcp = "hivemind.hivemind_server:main"
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["hivemind"]
+[tool.setuptools.packages.find]
+include = ["hivemind*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

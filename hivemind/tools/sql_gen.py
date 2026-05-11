@@ -5,6 +5,51 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Prompt sections — composed at call time into the final instruction block.
+# ---------------------------------------------------------------------------
+
+_SYSTEM_RULES = """\
+This tool generates SELECT-only HiveQL queries for data exploration and analysis.
+
+If the user requests a write operation (DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, \
+CREATE, MERGE, or any data modification), do not generate the query. Instead, respond:
+
+  "I can only generate read-only SELECT queries. For write operations, please use your \
+Hive client directly."
+
+Do not explain how the write query would work. Do not offer alternatives that involve \
+data modification.
+
+Additional rules:
+1. Do not use backticks anywhere. Write plain unquoted identifiers: database.table, alias.column.
+2. Use only tables and columns that appear in the metastore context below.
+3. Filter on partition keys first in WHERE to avoid full table scans.
+4. Use short 1–2 letter aliases for tables in JOINs.\
+"""
+
+_QUERY_HINTS = """\
+Query guidance:
+- Apply the most selective partition filter the question allows. If the question has no \
+time scope, use the most recent available partition value from the Partitions section.
+- Keep the query simple and readable. Prefer straightforward aggregations over subqueries \
+where possible.
+- Add LIMIT unless the question specifies a different row count.\
+"""
+
+_OUTPUT_FORMAT = """\
+Output format:
+- Produce a complete, runnable HiveQL SELECT query.
+- Do not add explanatory prose around the query.
+- When row-count stats are available, append the footer lines shown in the example below. \
+When stats are unavailable, omit the footer entirely.\
+"""
+
+# ---------------------------------------------------------------------------
+# Helpers for parsing assembled_context
+# ---------------------------------------------------------------------------
+
+
 def _parse_tables(ctx: str) -> list[str]:
     """Return fully-qualified table names from Schema: lines."""
     return re.findall(r"^Schema:\s*(\S+)", ctx, re.MULTILINE)
@@ -27,7 +72,6 @@ def _parse_row_counts(ctx: str) -> dict[str, str]:
     counts: dict[str, str] = {}
     current: str | None = None
     for line in ctx.splitlines():
-        # Top-level section header — track current table for both block types
         m = re.match(r"^(?:Statistics|Schema|Partitions):\s*(\S+)", line)
         if m:
             current = m.group(1)
@@ -114,13 +158,14 @@ def _build_hints(
     rows: dict[str, str],
     pkeys: dict[str, list[str]],
     date_cols: dict[str, list[str]],
+    include_footer: bool,
 ) -> str:
     """Produce the metastore-derived hint block injected into the prompt."""
     out: list[str] = [
-        "=== METASTORE HINTS (use these to fill the three footer lines) ===",
+        "=== METASTORE HINTS ===",
     ]
 
-    if tables:
+    if include_footer and tables:
         out.append("Tables in context: " + ", ".join(tables))
         out.append(
             "→ 'Tables used:' must list only the tables your query actually reads (FROM / JOIN)."
@@ -130,14 +175,17 @@ def _build_hints(
         out.append("Row counts from HMS stats:")
         for t, r in sorted(rows.items()):
             out.append(f"  {t}: {_format_row_count_abbreviated(r)} rows (raw: {r})")
-        out.append(
-            "→ 'Estimated rows:' must cite one of the numbers above; "
-            "when a WHERE clause filters rows, show both sides, e.g. ~5K (vs ~100K without filter)."
-        )
+        if include_footer:
+            out.append(
+                "→ 'Estimated rows:' must cite one of the numbers above; "
+                "when a WHERE clause filters rows, show both sides, e.g. ~5K (vs ~100K without filter)."
+            )
     else:
-        out.append("→ 'Estimated rows:' write 'unknown (no HMS stats)' if row counts are absent.")
+        out.append("Row counts unavailable in HMS stats.")
+        if not include_footer:
+            out.append("→ Footer lines must be omitted when stats are unknown.")
 
-    if pkeys:
+    if include_footer and pkeys:
         out.append("Partition columns (always filter on these to avoid full scans):")
         for t, ks in sorted(pkeys.items()):
             out.append(f"  {t}: {', '.join(ks)}")
@@ -146,7 +194,7 @@ def _build_hints(
             "e.g. 'year=2025, month=1 [applied]'. If the question has no time scope, "
             "pick the most recent available partition value from the Partitions section."
         )
-    else:
+    elif include_footer:
         out.append(
             "→ 'Partition filter:' write 'None [not partitioned]' — "
             "no partition pruning is possible for these tables."
@@ -163,7 +211,11 @@ def _build_hints(
     return "\n".join(out)
 
 
-# Query-type keyword groups — order matters (first match wins)
+# ---------------------------------------------------------------------------
+# Query-type detection
+# ---------------------------------------------------------------------------
+
+# Order matters — first match wins.
 _QUERY_TYPE_RULES: list[tuple[list[str], str]] = [
     (
         ["top", "rank", "ranking", "most", "highest", "best", "least", "lowest", "bottom",
@@ -209,8 +261,8 @@ def _detect_query_type(query: str) -> str:
 def _default_limit(query: str, query_type: str) -> str:
     """
     Derive a sensible default LIMIT.
-    - Top-N / ranking queries default to 10 (more useful than 5 in most cases).
-    - Time-series queries don't need a hard cap (30 periods is a reasonable default).
+    - Top-N / ranking queries default to 10.
+    - Time-series queries default to 30 periods.
     - Everything else defaults to 100.
     """
     q = query.lower()
@@ -226,11 +278,20 @@ def _default_limit(query: str, query_type: str) -> str:
     return "100"
 
 
+# ---------------------------------------------------------------------------
+# Output-format example generator
+# ---------------------------------------------------------------------------
+
 _SQL_FENCE_OPEN = "```sql\n-- NO BACKTICKS: use plain identifiers\n"
 _SQL_FENCE_CLOSE = "```\n"
 
 
-def _generate_example_query(query_type: str, pkeys: dict[str, list[str]], limit: str) -> str:
+def _generate_example_query(
+    query_type: str,
+    pkeys: dict[str, list[str]],
+    limit: str,
+    include_footer: bool,
+) -> str:
     """Return a generic output-format example that illustrates the required structure."""
     partition_footer = (
         "Partition filter: <key>=<value> [applied]"
@@ -277,7 +338,24 @@ def _generate_example_query(query_type: str, pkeys: dict[str, list[str]], limit:
         )
         footer = "Tables used: <db>.<table>\n{{pf}}\nEstimated rows: ~<N> (vs ~<M> without filter)"
 
-    return _SQL_FENCE_OPEN + sql + _SQL_FENCE_CLOSE + footer.format(pf=partition_footer)
+    output = _SQL_FENCE_OPEN + sql + _SQL_FENCE_CLOSE
+    if include_footer:
+        output += footer.format(pf=partition_footer)
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Safety guards
+# ---------------------------------------------------------------------------
+
+# Broad write-verb check — matched against the raw user input before any tools are called.
+# A single bare keyword is enough to refuse: requiring a second structural word (table,
+# record, etc.) caused legitimate write requests to slip through when phrased naturally
+# (e.g. "delete inactive users", "insert the missing rows").
+_WRITE_VERB_RE = re.compile(
+    r"\b(delete|insert|update|drop|truncate|alter|create|merge|overwrite)\b",
+    re.IGNORECASE,
+)
 
 
 def _strip_backticks(text: str) -> str:
@@ -294,10 +372,36 @@ def _is_error_context(ctx: str) -> bool:
     return False
 
 
+def _is_write_operation_request(query: str) -> tuple[bool, str]:
+    """
+    Detect whether the natural language query is requesting a write operation.
+
+    Uses a broad single-verb regex so that naturally phrased requests
+    ("delete inactive users", "insert the missing rows") are caught without
+    requiring a second structural keyword nearby.
+
+    Returns:
+        (is_write, operation_type): True if a write verb is detected, with the
+        matched verb in upper case.
+    """
+    m = _WRITE_VERB_RE.search(query)
+    if m:
+        return True, m.group(1).upper()
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
+# Main handler
+# ---------------------------------------------------------------------------
+
+
 async def handle_text_to_hiveql(natural_query: str, assembled_context: str) -> str:
     """
-    Formats the schema/partition context and user query into a structured prompt
-    that instructs the LLM to produce a safe, well-formed HiveQL query.
+    Format schema/partition context and a natural language query into a structured
+    prompt that instructs the LLM to produce a safe, well-formed HiveQL SELECT query.
+
+    This tool only generates SELECT queries. Write operations are rejected before the
+    prompt is assembled.
     """
     try:
         if not natural_query.strip():
@@ -314,44 +418,48 @@ async def handle_text_to_hiveql(natural_query: str, assembled_context: str) -> s
                 f"Context received: {assembled_context}"
             )
 
-        # Parse before stripping so regex anchors match the original format
+        is_write, operation = _is_write_operation_request(natural_query)
+        if is_write:
+            return (
+                f"Error: {operation} operations are not supported.\n\n"
+                "This tool generates SELECT queries only. To modify data, use Beeline or Hive CLI directly.\n\n"
+                f"Blocked request: '{natural_query.strip()}'"
+            )
+
         tables = _parse_tables(assembled_context)
         rows = _parse_row_counts(assembled_context)
         pkeys, date_cols = _parse_columns_and_partitions(assembled_context)
 
+        # Parse before stripping so regex anchors match the original format
         clean_context = _strip_backticks(assembled_context)
 
         query_type = _detect_query_type(natural_query)
         limit = _default_limit(natural_query, query_type)
-        hints = _build_hints(tables, rows, pkeys, date_cols)
-        example = _generate_example_query(query_type, pkeys, limit)
+        include_footer = bool(rows)
+        hints = _build_hints(tables, rows, pkeys, date_cols, include_footer)
+        example = _generate_example_query(query_type, pkeys, limit, include_footer)
 
-        prompt = "\n".join([
-            "CRITICAL: Do NOT use backticks anywhere in the SQL. "
-            "Write plain unquoted identifiers: database.table, alias.column.",
-            "",
-            "You MUST write a complete, runnable HiveQL query. No hedging. No refusal.",
-            "The user already has a cluster and knows how to run it.",
-            "Output ONLY the SQL and the required footer. Do NOT add conversational filler like 'Run this on your cluster' or 'I only have metadata'.",
-            "",
+        output_instruction = (
+            "Output ONLY the SQL query in a ```sql block. Do not include footer lines."
+            if not include_footer
+            else "Output ONLY the SQL and the required footer lines."
+        )
+
+        prompt = "\n\n".join([
+            _SYSTEM_RULES,
+            _QUERY_HINTS,
+            _OUTPUT_FORMAT,
+            output_instruction,
             f"Request: {natural_query.strip()}",
             f"Detected query pattern: {query_type}",
-            "",
             hints,
-            "",
-            "Full metastore context:",
-            clean_context.strip(),
-            "",
-            "Rules (keep the query simple and easy to read):",
-            "1. NO backticks — plain identifiers only: database.table, alias.column.",
-            "2. Filter on partition keys first in WHERE to avoid full table scans.",
-            "3. Use short 1-2 letter aliases for tables in JOINs.",
-            f"4. Add LIMIT {limit} unless the question asks for a different number.",
-            "5. SELECT only — no INSERT, UPDATE, DROP, CREATE, or any other write statements.",
-            "6. Use only tables and columns from the metastore context above.",
-            "",
-            "=== OUTPUT FORMAT ===",
-            example,
+            # TODO: semantic column prioritization — replace full schema pass-through with
+            # a selection step that surfaces partition keys, numeric metrics, low-cardinality
+            # dimensions, and join keys in priority order. This is the highest-impact future
+            # improvement for SQL quality.
+            "Full metastore context:\n" + clean_context.strip(),
+            f"Add LIMIT {limit} unless the question specifies a different row count.\n\n"
+            "=== OUTPUT FORMAT ===\n" + example,
         ])
 
         return prompt

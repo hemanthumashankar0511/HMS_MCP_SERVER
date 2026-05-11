@@ -5,17 +5,10 @@ import os
 import sys
 from pathlib import Path
 
+from fastmcp import FastMCP
+from dotenv import load_dotenv
+
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-_GEN = _ROOT / "gen-py"
-if _GEN.is_dir() and str(_GEN) not in sys.path:
-    sys.path.insert(0, str(_GEN))
-
-from fastmcp import FastMCP  # noqa: E402
-from dotenv import load_dotenv  # noqa: E402
-
 load_dotenv(_ROOT / ".env")
 
 from hivemind.hms_client import HMSClient  # noqa: E402
@@ -50,29 +43,16 @@ if not _HMS_HOST:
 
 _client: HMSClient | None = None
 
-logger.info("Connecting to HMS at %s:%d", _HMS_HOST, _HMS_PORT)
-
-try:
-    _client = HMSClient(_HMS_HOST, _HMS_PORT, _TIMEOUT_MS)
-    logger.info("HMS connection established.")
-except Exception as _conn_exc:
-    logger.error("Could not connect to HMS: %s", _conn_exc)
-
 mcp = FastMCP(
     name="hivemind",
     instructions=(
-        "HiveMind - Hive Metastore discovery tools (read-only). "
+        "HiveMind provides read-only Hive Metastore discovery tools. "
         f"Connected to HMS at {_HMS_HOST}:{_HMS_PORT}. "
-        "IMPORTANT RULES — follow these without exception: "
-        "1. For ANY SQL or HiveQL request, you MUST first call get_table_schema (and "
-        "get_partitions if the table is partitioned) to get the real column names and types. "
-        "NEVER skip this step even if you think you know the schema. "
-        "2. After gathering metadata, you MUST always produce a complete, runnable HiveQL "
-        "query. Output ONLY the query and required footer. Do NOT add conversational filler, intros, or outros. "
-        "NEVER explain that you only have metadata or tell the user to run it on their cluster. Just output the query. "
-        "3. To generate HiveQL: call search_tables, get_table_schema, get_partitions, "
-        "then call text_to_hiveql with assembled_context = the combined tool output. "
-        "4. Always end your response with the final HiveQL query in a ```sql block."
+        "This server generates SELECT-only HiveQL queries. "
+        "If the user asks for a write operation (DELETE, INSERT, UPDATE, DROP, TRUNCATE, "
+        "ALTER, CREATE, MERGE, or any data modification), refuse immediately without "
+        "calling any tools or explaining how the operation would work. "
+        "For all other requests, fetch schema metadata before generating SQL queries."
     ),
 )
 
@@ -80,7 +60,7 @@ mcp = FastMCP(
 def _require_client() -> HMSClient:
     if _client is None:
         raise RuntimeError(
-            f"HMS client unavailable - connection to {_HMS_HOST}:{_HMS_PORT} failed at startup."
+            f"HMS client unavailable — connection to {_HMS_HOST}:{_HMS_PORT} failed at startup."
         )
     return _client
 
@@ -162,10 +142,12 @@ async def _tool_get_table_ddl(database: str, table: str) -> str:
 @mcp.tool(
     name="text_to_hiveql",
     description=(
-        "Final step in SQL generation. Takes a natural language question and the schema "
-        "context from get_table_schema / get_partitions and produces a simple, readable "
-        "HiveQL query. Always call get_table_schema (and get_partitions if partitioned) first, "
-        "then pass those outputs as assembled_context."
+        "Final step in SELECT query generation. Takes a natural language question and the "
+        "schema context from get_table_schema / get_partitions and produces a HiveQL SELECT "
+        "query. Always call get_table_schema (and get_partitions if partitioned) first, then "
+        "pass those outputs as assembled_context. Do NOT call this tool for write operations "
+        "(DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, CREATE, MERGE) — refuse those "
+        "requests directly without fetching any schema."
     ),
 )
 async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> str:
@@ -173,6 +155,14 @@ async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> st
 
 
 def main() -> None:
+    global _client
+    logger.info("Connecting to HMS at %s:%d", _HMS_HOST, _HMS_PORT)
+    try:
+        _client = HMSClient(_HMS_HOST, _HMS_PORT, _TIMEOUT_MS)
+        logger.info("HMS connection established.")
+    except Exception as exc:
+        logger.error("Failed to connect to HMS: %s", exc)
+        sys.exit(1)
     mcp.run()
 
 
