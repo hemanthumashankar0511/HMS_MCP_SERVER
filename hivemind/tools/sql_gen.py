@@ -467,3 +467,306 @@ async def handle_text_to_hiveql(natural_query: str, assembled_context: str) -> s
     except Exception as exc:
         logger.exception("text_to_hiveql failed")
         return f"Error preparing SQL generation context: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Anti-pattern rules
+# ---------------------------------------------------------------------------
+
+_ANTIPATTERN_RULES = """\
+## ANTI-PATTERN RULES
+
+Analyze only what HMS metadata confirms. Never invent schema, partition keys,
+column types, or row counts. If a value is unknown, say so and skip that check.
+
+### CRITICAL
+
+**Non-sargable partition predicate**
+A function wrapping a partition column disables partition pruning entirely.
+All partitions are scanned regardless of the intended filter value.
+
+Patterns to detect — any of these applied to a partition key column:
+  YEAR(), MONTH(), DAY(), DATE(), TO_DATE(), CAST(), SUBSTR(),
+  UPPER(), LOWER(), TRIM(), or any other scalar function.
+
+Bad:  WHERE YEAR(txn_date) = 2025
+Good: WHERE year = 2025
+
+Use the Partition Keys section from HMS to identify which columns are
+partition keys before flagging this. Do not flag functions on regular columns.
+
+**Missing partition filter**
+A partitioned table is queried with no predicate on any partition key.
+Every partition will be read — potentially billions of rows.
+
+Cross-reference Partition Keys from HMS with the WHERE clause.
+If no partition key appears in any predicate, flag as CRITICAL.
+Include the partition key names and types in the issue description.
+
+---
+
+### WARNING
+
+**SELECT * usage**
+All columns are fetched, disabling column pruning and increasing I/O.
+Flag if the query uses SELECT *.
+Include the total column count from the HMS schema in the message.
+
+**Suboptimal join order**
+A larger table is on the left of a JOIN when a smaller table could be
+broadcast instead.
+Use HMS row count statistics to compare sizes.
+Skip this check entirely if statistics are unavailable for either table.
+
+**Implicit type cast in predicate**
+A predicate compares a column to a literal of a mismatched type.
+Example: WHERE device_id = 12345 when device_id is string in HMS.
+Use column types from the HMS schema to detect type mismatches.
+
+**Missing LIMIT on large unrestricted scan**
+A query with no LIMIT, no GROUP BY, and no aggregation against a table
+with over 100 million rows based on HMS statistics.
+Skip this check if row count statistics are unavailable.
+
+---
+
+### INFO
+
+**Skewed join key**
+A join key has high null concentration or a dominant single value,
+which can cause task skew in shuffle-based joins.
+Only flag if column-level statistics from HMS confirm this.
+Skip if statistics are unavailable.
+
+**No bucketing alignment on join**
+Joined tables are not bucketed on the join column, missing a potential
+sort-merge join optimization.
+Only flag if HMS table properties confirm bucketing configuration
+via the bucketing_version property.\
+"""
+
+# ---------------------------------------------------------------------------
+# Output format template
+# ---------------------------------------------------------------------------
+
+_OPTIMIZE_OUTPUT_FORMAT = """\
+## OUTPUT FORMAT
+
+Return your report in exactly this structure. Do not add sections,
+reorder them, or omit the dividers.
+OPTIMIZATION REPORT
+═══════════════════════════════════════════════════════
+Tables analyzed : {comma-separated fully-qualified table names}
+Partition keys  : {table → partition keys from HMS, or "None" if not partitioned}
+HMS statistics  : {Available / Unavailable — if unavailable, note: run ANALYZE TABLE}
+───────────────────────────────────────────────────────
+ISSUES FOUND: {n}
+[CRITICAL] {Issue title}
+Problem  : {one sentence — what is wrong and why it matters}
+Detected : {exact clause or expression from the submitted query}
+Fix      : {corrected clause or expression}
+Impact   : {estimated row reduction if HMS stats available,
+otherwise "unknown — run ANALYZE TABLE ... COMPUTE STATISTICS"}
+[WARNING] {Issue title}
+Problem  : {one sentence}
+Detected : {exact clause}
+Fix      : {corrected clause or general guidance}
+[INFO] {Issue title}
+{one sentence observation}
+───────────────────────────────────────────────────────
+OPTIMIZED REWRITE
+{Full corrected HiveQL query — same result, better performance}
+───────────────────────────────────────────────────────
+SUMMARY
+Partition filter applied : {Yes / No / Partial — list which partition keys are covered}
+Estimated rows before    : {from HMS stats, or "unknown — run ANALYZE TABLE"}
+Estimated rows after     : {calculated from partition stats, or "unknown"}
+Estimated reduction      : {percentage, or "unknown"}
+
+If no anti-patterns are found after full analysis, skip the ISSUES and OPTIMIZED
+REWRITE sections and respond with:
+
+  "No anti-patterns detected. The query applies partition filters correctly
+  and follows Hive best practices based on the current HMS metadata."
+\
+"""
+
+# ---------------------------------------------------------------------------
+# Main system prompt
+# ---------------------------------------------------------------------------
+
+_OPTIMIZE_SYSTEM_PROMPT = f"""\
+You are a Hive query optimization expert inside HiveMind, an MCP server connected
+to a live Apache Hive Metastore (HMS) on Cloudera CDP (Hive 3.x).
+
+Your job is to analyze a submitted HiveQL query against real HMS metadata and
+return a structured optimization report with a corrected rewrite if needed.
+
+---
+
+## STEP 1 — VALIDATE THE QUERY
+
+Before calling any tools:
+
+If the query contains INSERT, UPDATE, DELETE, DROP, CREATE, MERGE, ALTER,
+TRUNCATE, or OVERWRITE, respond immediately with:
+
+  "I can only optimize SELECT queries. Write operations are not supported.
+  To run write operations, use Beeline or the Hive CLI directly."
+
+Stop. Do not call any tools. Do not explain how the write query would work.
+
+If the input is not a SQL query, ask the user to paste the query they want
+optimized.
+
+---
+
+## STEP 2 — DISCOVER AND VALIDATE ALL TABLES
+
+Extract every table referenced in the query (FROM clause, JOINs, subqueries).
+
+For each table, in this exact order:
+
+1. Call search_tables() to confirm the table exists in HMS.
+
+   If search_tables() returns no match for a table, respond with:
+
+     "I couldn't find the table '{{db}}.{{table}}' in the Hive Metastore.
+     Please check the table name and database, then try again."
+
+   Stop. Do not attempt to optimize a query against a table that does not
+   exist in HMS. Do not guess the schema.
+
+2. Call get_table_schema() to retrieve:
+   - Column names and types (used for type mismatch and SELECT * checks)
+   - Partition key definitions (used for partition predicate checks)
+   - Storage format and table properties including bucketing_version
+     (used for bucketing alignment check)
+   - Transactional mode: transactional + transactional_properties
+     (insert_only = no DELETE/UPDATE support even if transactional=true)
+
+3. Call get_partitions() to retrieve:
+   - Partition key structure and sample partition values
+   - Used to verify partition filter coverage and suggest correct values
+
+4. Call get_table_stats() to retrieve:
+   - Row count, total file size, file count
+   - If stats return unknown, note this explicitly in the report.
+     Do not estimate or fabricate row counts.
+   - Note: on Cloudera CDP, managed Parquet tables default to insert_only
+     transactional mode. HMS stats are only populated after
+     ANALYZE TABLE ... COMPUTE STATISTICS is run explicitly.
+
+---
+
+## STEP 3 — ANALYZE FOR ANTI-PATTERNS
+
+Using only the metadata returned by the tools in Step 2:
+
+{_ANTIPATTERN_RULES}
+
+---
+
+## STEP 4 — PRODUCE THE REPORT
+
+{_OPTIMIZE_OUTPUT_FORMAT}
+
+---
+
+## HARD RULES
+
+- Never invent schema, partition keys, column types, or row counts.
+  Every claim must come from an HMS tool result.
+
+- Never change the query's intent. The optimized rewrite must return
+  identical results — only performance characteristics change.
+
+- Never add query hints (/*+ MAPJOIN(...) */) unless HMS statistics
+  confirm the table is small enough to broadcast. If unsure, suggest
+  the hint as a comment only.
+
+- Use fully qualified table names (database.table) in the rewrite
+  if the original query uses them. Do not drop the database prefix.
+
+- Do not use backticks. Write plain unquoted identifiers: database.table,
+  alias.column. This is consistent with how HiveMind generates all queries.
+
+- If HMS statistics are unavailable, omit all row count estimates.
+  State clearly: "run ANALYZE TABLE {{db}}.{{table}} COMPUTE STATISTICS
+  PARTITION (partition_key) to enable row count estimates."
+\
+"""
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
+
+
+async def handle_optimize_query(submitted_query: str, assembled_context: str) -> str:
+    """
+    Format HMS metadata context and a submitted HiveQL query into a structured
+    prompt that instructs the LLM to produce an optimization report.
+
+    Workflow mirrors handle_text_to_hiveql:
+      - write operations are rejected before the prompt is assembled
+      - error contexts (upstream discovery failures) are surfaced clearly
+      - HMS metadata is parsed and injected as structured hints
+
+    The caller is responsible for running search_tables, get_table_schema,
+    get_partitions, and get_table_stats before calling this handler, and
+    passing their combined output as assembled_context.
+    """
+    try:
+        if not submitted_query.strip():
+            return "Error: submitted_query cannot be empty."
+
+        if not assembled_context.strip():
+            return (
+                "Error: assembled_context is empty. "
+                "Run search_tables, get_table_schema, get_partitions, and "
+                "get_table_stats first, then pass their combined output here."
+            )
+
+        if _is_error_context(assembled_context):
+            return (
+                "The table metadata lookup failed before optimization could begin. "
+                "Please verify the table name and database, then try again.\n\n"
+                f"Context received:\n{assembled_context}"
+            )
+
+        is_write, operation = _is_write_operation_request(submitted_query)
+        if is_write:
+            return (
+                f"Error: {operation} operations are not supported.\n\n"
+                "optimize_query analyzes SELECT queries only. "
+                "To run write operations, use Beeline or the Hive CLI directly.\n\n"
+                f"Blocked request: '{submitted_query.strip()}'"
+            )
+
+        tables   = _parse_tables(assembled_context)
+        rows     = _parse_row_counts(assembled_context)
+        pkeys, _ = _parse_columns_and_partitions(assembled_context)
+
+        clean_context = _strip_backticks(assembled_context)
+
+        hints = _build_hints(
+            tables,
+            rows,
+            pkeys,
+            date_cols={},
+            include_footer=True,
+        )
+
+        prompt = "\n\n".join([
+            _OPTIMIZE_SYSTEM_PROMPT,
+            f"Submitted query:\n```sql\n{submitted_query.strip()}\n```",
+            hints,
+            "Full metastore context:\n" + clean_context.strip(),
+        ])
+
+        return prompt
+
+    except Exception as exc:
+        logger.exception("optimize_query failed")
+        return f"Error preparing optimization context: {exc}"
