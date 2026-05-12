@@ -23,6 +23,7 @@ from hivemind.tools.discovery import (  # noqa: E402
 )
 from hivemind.tools.sql_gen import handle_text_to_hiveql  # noqa: E402
 from hivemind.tools.optimize import handle_optimize_query  # noqa: E402
+from hivemind.tools.explain import handle_explain_query  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,6 +172,23 @@ async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> st
 )
 async def _tool_optimize_query(submitted_query: str) -> str:
     return await handle_optimize_query(_require_client(), submitted_query)
+
+
+@mcp.tool(
+    name="explain_query",
+    description=(
+        "Explain what a HiveQL query does in plain English, identify where it may "
+        "be slow or expensive based on HMS metadata, and suggest concrete optimizations "
+        "— all without executing the query. "
+        "Works on any query type including SELECT, DDL, and DML. "
+        "Always call get_table_schema, get_partitions, and get_table_stats first "
+        "for every table in the query, then pass their combined output as assembled_context. "
+        "Reasons entirely from HMS metadata: schema, partition definitions, and statistics. "
+        "Does not connect to HiveServer2 and does not run EXPLAIN."
+    ),
+)
+async def _tool_explain_query(submitted_query: str, assembled_context: str) -> str:
+    return await handle_explain_query(submitted_query, assembled_context)
 
 
 def main() -> None:
