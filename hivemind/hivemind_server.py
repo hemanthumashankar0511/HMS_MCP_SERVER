@@ -21,7 +21,8 @@ from hivemind.tools.discovery import (  # noqa: E402
     handle_list_tables,
     handle_search_tables,
 )
-from hivemind.tools.sql_gen import handle_text_to_hiveql, handle_optimize_query  # noqa: E402
+from hivemind.tools.sql_gen import handle_text_to_hiveql  # noqa: E402
+from hivemind.tools.optimize import handle_optimize_query  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,7 +112,9 @@ async def _tool_get_table_schema(database: str, table: str) -> str:
     name="get_table_stats",
     description=(
         "Fetch table statistics from HMS: row count, total size, and number of files. "
-        "Returns a warning if statistics have not been computed."
+        "For partitioned tables, returns table-level BASIC_STATS plus a sampled "
+        "partition-level BASIC_STATS section. Returns a warning if statistics have not "
+        "been computed."
     ),
 )
 async def _tool_get_table_stats(database: str, table: str) -> str:
@@ -159,16 +162,15 @@ async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> st
     description=(
         "Analyze a HiveQL SELECT query for performance anti-patterns and return "
         "a structured report with severity-ranked issues and a corrected rewrite. "
-        "Always call get_table_schema, get_partitions, and get_table_stats first "
-        "for every table in the query, then pass their combined output as "
-        "assembled_context. "
+        "HMS metadata (schema, partitions, statistics) is fetched automatically "
+        "for every table in the query — no pre-fetched context is required. "
         "Only SELECT queries are supported. Refuse write operations "
         "(DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, CREATE, MERGE) "
         "without calling any tools."
     ),
 )
-async def _tool_optimize_query(submitted_query: str, assembled_context: str) -> str:
-    return await handle_optimize_query(submitted_query, assembled_context)
+async def _tool_optimize_query(submitted_query: str) -> str:
+    return await handle_optimize_query(_require_client(), submitted_query)
 
 
 def main() -> None:

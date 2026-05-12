@@ -70,6 +70,69 @@ def _format_table_type(table_type: str) -> str:
     }.get(table_type, table_type)
 
 
+def _append_partition_basic_stats(
+    lines: list[str],
+    client: "HMSClient",
+    database: str,
+    table: str,
+    max_parts: int = 20,
+) -> None:
+    """Append sampled partition BASIC_STATS without treating them as table-level stats."""
+    lines.append("Partition-level BASIC_STATS sample (same cap as get_partitions):")
+    try:
+        part_names = client.get_partition_names(database, table, max_parts=max_parts)
+    except Exception as exc:
+        lines.append(f"  (could not list partitions: {exc})")
+        return
+
+    if not part_names:
+        lines.append("  No partition data found (table may be empty or not yet populated).")
+        return
+
+    sum_rows = 0
+    parts_with_rows = 0
+    detail: list[str] = []
+    for pn in part_names:
+        try:
+            pst = client.get_partition_basic_stats(database, table, pn)
+        except Exception as exc:
+            detail.append(f"  {pn} (metadata error: {exc})")
+            continue
+
+        nr = pst["num_rows"]
+        nf = pst["num_files"]
+        sz = pst["total_size"]
+        rows_i = _stat_int(nr)
+        if rows_i >= 0:
+            sum_rows += rows_i
+            parts_with_rows += 1
+
+        if nr == "-1" and nf == "-1" and sz == "-1":
+            detail.append(f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)")
+        else:
+            detail.append(
+                f"  {pn}  rows={_format_count(nr)}  "
+                f"files={_format_count(nf)}  size={_format_bytes(sz)}"
+            )
+
+    lines.extend(detail)
+    suffix = ""
+    if len(part_names) >= max_parts:
+        suffix = " Partial sum — up to 20 partitions sampled; analyze all partitions separately if needed."
+    if parts_with_rows:
+        lines.append("")
+        lines.append(
+            f"  Sum(rows) over partitions with usable numRows ({parts_with_rows} partition(s)): "
+            f"{sum_rows:,}{suffix}"
+        )
+    else:
+        lines.append("")
+        lines.append(
+            "  No partition-level numRows in HMS sample. "
+            "Run ANALYZE TABLE ... PARTITION(...) COMPUTE STATISTICS."
+        )
+
+
 async def handle_list_databases(client: "HMSClient") -> str:
     try:
         dbs = client.get_all_databases()
@@ -192,7 +255,7 @@ async def handle_get_table_stats(
         logger.exception("get_table_stats failed for %s.%s", database, table)
         return f"Error fetching stats for '{database}.{table}': {exc}"
 
-    lines = [f"Statistics: {database}.{table}", "=" * 50]
+    lines = [f"Statistics: {database}.{table}", "=" * 50, "Table-level BASIC_STATS:"]
 
     lines += [
         f"  Rows       : {_format_count(stats['num_rows'])}",
@@ -202,58 +265,30 @@ async def handle_get_table_stats(
     if stats["last_modified"]:
         lines.append(f"  Last DDL   : {stats['last_modified']}")
 
-    # Table-level HMS stats are often absent for partitioned tables; roll up sampled partitions.
+    try:
+        info = client.get_table(database, table)
+    except Exception as exc:
+        logger.debug("get_table for partition stats failed: %s", exc)
+        return "\n".join(lines)
+
     if not stats["stats_available"]:
-        try:
-            info = client.get_table(database, table)
-        except Exception as exc:
-            logger.debug("get_table for partition rollup failed: %s", exc)
-            return "\n".join(lines)
+        lines.append("")
         if info.get("partition_keys"):
-            lines.append("")
             lines.append(
-                "Table-level numRows absent in HMS. Sample partition stats (same cap as get_partitions):"
+                "Table-level numRows absent in HMS. "
+                "Use the partition sample below for visibility, or run "
+                f"ANALYZE TABLE {database}.{table} COMPUTE STATISTICS for table-level totals."
             )
-            try:
-                part_names = client.get_partition_names(database, table, max_parts=20)
-            except Exception as exc:
-                lines.append(f"  (could not list partitions: {exc})")
-                return "\n".join(lines)
-            sum_rows = 0
-            parts_with_rows = 0
-            detail: list[str] = []
-            for pn in part_names:
-                try:
-                    pst = client.get_partition_basic_stats(database, table, pn)
-                except Exception as exc:
-                    detail.append(f"  {pn} (metadata error: {exc})")
-                    continue
-                nr = pst["num_rows"]
-                nf = pst["num_files"]
-                sz = pst["total_size"]
-                rows_i = _stat_int(nr)
-                if rows_i >= 0:
-                    sum_rows += rows_i
-                    parts_with_rows += 1
-                detail.append(
-                    f"  {pn}  rows={nr}  files={nf}  size={sz}"
-                    if nr != "-1" or nf != "-1" or sz != "-1"
-                    else f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)"
-                )
-            lines.extend(detail)
-            suffix = ""
-            if len(part_names) >= 20:
-                suffix = " Partial sum — up to 20 partitions sampled; analyze all partitions separately if needed."
-            if parts_with_rows:
-                lines.append("")
-                lines.append(
-                    f"  Sum(rows) over partitions with usable numRows ({parts_with_rows} partition(s)): {sum_rows:,}{suffix}"
-                )
-            elif part_names:
-                lines.append("")
-                lines.append(
-                    "  No partition-level numRows in HMS sample. Run ANALYZE TABLE ... PARTITION(...) COMPUTE STATISTICS."
-                )
+        else:
+            lines.append(
+                "Table-level numRows absent in HMS. "
+                f"Run ANALYZE TABLE {database}.{table} COMPUTE STATISTICS."
+            )
+
+    # Partitioned tables can have table-level and partition-level stats independently.
+    if info.get("partition_keys"):
+        lines.append("")
+        _append_partition_basic_stats(lines, client, database, table)
 
     return "\n".join(lines)
 
