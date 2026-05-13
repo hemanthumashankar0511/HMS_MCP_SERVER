@@ -50,11 +50,13 @@ mcp = FastMCP(
     instructions=(
         "HiveMind provides read-only Hive Metastore discovery tools. "
         f"Connected to HMS at {_HMS_HOST}:{_HMS_PORT}. "
-        "This server generates SELECT-only HiveQL queries. "
-        "If the user asks for a write operation (DELETE, INSERT, UPDATE, DROP, TRUNCATE, "
-        "ALTER, CREATE, MERGE, or any data modification), refuse immediately without "
-        "calling any tools or explaining how the operation would work. "
-        "For all other requests, fetch schema metadata before generating SQL queries."
+        "This server never executes HiveQL and only reads HMS metadata. "
+        "text_to_hiveql generates SELECT-only HiveQL and optimize_query supports "
+        "SELECT queries only; refuse write operations for those tools. "
+        "explain_query may explain any HiveQL query type, including DDL and DML "
+        "(DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, CREATE, MERGE), using "
+        "HMS metadata only. "
+        "For query generation or explanation requests, fetch schema metadata first."
     ),
 )
 
