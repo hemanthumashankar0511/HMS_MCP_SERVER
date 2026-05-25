@@ -1,14 +1,7 @@
 from __future__ import annotations
 
 import logging
-import re
-from typing import TYPE_CHECKING
 
-from hivemind.tools.discovery import (
-    handle_get_partitions,
-    handle_get_table_schema,
-    handle_get_table_stats,
-)
 from hivemind.tools.sql_gen import (
     _build_hints,
     _is_error_context,
@@ -18,55 +11,7 @@ from hivemind.tools.sql_gen import (
     _strip_backticks,
 )
 
-if TYPE_CHECKING:
-    from hivemind.hms_client import HMSClient
-
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# SQL table extraction
-# ---------------------------------------------------------------------------
-
-_TABLE_NAME = r"`?([a-zA-Z_][a-zA-Z0-9_]*)`?(?:\.`?([a-zA-Z_][a-zA-Z0-9_]*)`?)?"
-
-_TABLE_REF_RE = re.compile(
-    rf"\b(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO|ANALYZE\s+TABLE|ALTER\s+TABLE|"
-    rf"DROP\s+TABLE|TRUNCATE\s+TABLE|DELETE\s+FROM)\s+{_TABLE_NAME}",
-    re.IGNORECASE,
-)
-_INSERT_OVERWRITE_RE = re.compile(
-    rf"\bINSERT\s+OVERWRITE\s+(?:TABLE\s+)?{_TABLE_NAME}",
-    re.IGNORECASE,
-)
-_CTE_RE = re.compile(r"\bWITH\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?\s+AS\s*\(", re.IGNORECASE)
-
-
-def _extract_tables_from_sql(sql: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """
-    Return deduplicated fully-qualified tables and unqualified table names.
-
-    The explain tool accepts DDL, DML, and SELECT statements, so this covers the
-    common table-bearing clauses used by those statement types.
-    """
-    cte_names = {name.lower() for name in _CTE_RE.findall(sql)}
-    seen: set[tuple[str, str]] = set()
-    qualified: list[tuple[str, str]] = []
-    unqualified: list[str] = []
-
-    for pattern in (_TABLE_REF_RE, _INSERT_OVERWRITE_RE):
-        for first, second in pattern.findall(sql):
-            if second:
-                key = (first.lower(), second.lower())
-                if key not in seen:
-                    seen.add(key)
-                    qualified.append((first, second))
-                continue
-
-            if first.lower() not in cte_names and first not in unqualified:
-                unqualified.append(first)
-
-    return qualified, unqualified
-
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -78,50 +23,210 @@ to a live Apache Hive Metastore (HMS) on Cloudera CDP (Hive 3.x).
 
 Your job is to explain what a submitted HiveQL query does in plain English,
 identify where it may be slow or expensive based on real HMS metadata, and
-suggest concrete optimizations without executing the query.
+suggest concrete optimizations — all without executing the query.
 
-The HMS metadata has already been fetched for every table referenced in the
-submitted query and is provided below. Use only that metadata: schema,
-partition definitions, table properties, and statistics. Never guess values
-that are not present in the metadata.
-
----
-
-## VALIDATION RULES
-
-If the input is not a SQL query, ask the user to paste the query they want
-explained.
-
-Write operations and DDL (INSERT, UPDATE, DELETE, DROP, CREATE, MERGE, ALTER,
-TRUNCATE, OVERWRITE, ANALYZE) are valid to explain. Do not reject them. Add this
-note at the top of the explanation:
-
-  "Note: This is a write or metadata operation. HiveMind does not execute
-  queries. This explanation is based on HMS metadata only."
+You reason entirely from HMS metadata: schema, partition definitions, and
+statistics. You never guess, infer, or fabricate values not present in the
+HMS tool results.
 
 ---
 
-## WHAT TO EXPLAIN
+## STEP 1 — VALIDATE THE INPUT
+
+Before calling any tools:
+
+Check if the input is a SQL query. If not, ask the user to paste the query
+they want explained.
+
+Write operations (INSERT, UPDATE, DELETE, DROP, CREATE, MERGE, ALTER,
+TRUNCATE, OVERWRITE) are still valid to explain — unlike optimize_query and
+text_to_hiveql, this tool explains any query including DDL and DML.
+However, add a clear note at the top of the explanation:
+
+  "Note: This is a write operation. HiveMind does not execute queries.
+  This explanation is based on HMS metadata only."
+
+---
+
+## STEP 2 — DISCOVER ALL TABLES FROM HMS
+
+Extract every table referenced in the query — FROM clause, JOINs, subqueries,
+CTEs, and INSERT targets.
+
+For each table, in this exact order:
+
+1. Call search_tables() to confirm the table exists in HMS.
+
+   If search_tables() returns no match, respond with:
+
+     "I couldn't find the table '{database}.{table}' in the Hive Metastore.
+     Please check the table name and database, then try again."
+
+   Stop. Do not attempt to explain a query against a table that does not
+   exist in HMS. Do not guess the schema.
+
+2. Call get_table_schema() to retrieve:
+   - Column names and types
+   - Partition key definitions and their types
+   - Storage format: ORC / Parquet / TextFile / Avro
+   - Table properties: transactional, transactional_properties,
+     bucketing_version
+   - Table type: MANAGED_TABLE / EXTERNAL_TABLE
+
+   Important for Cloudera CDP:
+   - Managed ORC + transactional=true + no transactional_properties
+     → full ACID (supports INSERT, UPDATE, DELETE, MERGE)
+   - Managed Parquet + transactional=true + transactional_properties=insert_only
+     → insert-only ACID (INSERT only; DELETE/UPDATE/MERGE will fail at runtime)
+   - External table → non-transactional regardless of properties
+
+3. Call get_partitions() to retrieve:
+   - Partition key structure and types
+   - Sample partition values (up to HMS cap of 20)
+   - Used to reason about partition pruning and data skew
+
+4. Call get_table_stats() to retrieve:
+   - numRows: total row count
+   - totalSize: total data size on disk
+   - numFiles: number of underlying files
+   - If stats return unknown: note this and skip all quantitative estimates.
+     State: "Run ANALYZE TABLE {database}.{table} PARTITION ({key})
+     COMPUTE STATISTICS to enable row count estimates."
+
+---
+
+## STEP 3 — EXPLAIN THE QUERY
+
+Using only the metadata from Step 2, produce a structured explanation
+covering all five sections below.
+
+### Section 1 — What this query does
+
+Write 2–4 sentences in plain English describing:
+- What data is being read (tables, joins)
+- What filtering is applied (WHERE clause)
+- What the query computes (aggregations, transformations, projections)
+- What is returned (columns, ordering, row limit)
+
+Write for an analyst who knows SQL but not HiveQL internals.
+Do not use technical jargon beyond basic SQL terms.
+
+### Section 2 — Tables and data volume
+
+For each table in the query:
+- State the table name, type (Managed / External), and storage format
+- State the transactional mode if relevant (full ACID / insert-only / non-transactional)
+- State row count and total size from HMS statistics
+- If stats are unavailable: state "Row count unknown — ANALYZE TABLE not run"
+- State the partition keys and how many sample partitions HMS returned
+
+Example:
+  sales.sales_transactions
+    Type    : Managed, ORC, full ACID
+    Rows    : 500 (from HMS stats)
+    Size    : 48.2 KB
+    Partitioned by: sale_date (STRING)
+    Sample partitions: sale_date=2026-05-11
+
+### Section 3 — Partition analysis
+
+This is the most important section for Hive performance.
+
+For each partitioned table:
+
+A. Identify whether the query applies a partition filter:
+
+   - If a direct equality or range filter on a partition key exists:
+     → "Partition filter applied: {key} = '{value}' [effective]"
+     → Estimate rows scanned if HMS stats are available
+
+   - If a function is applied to a partition key column:
+     → "Non-sargable predicate detected: {expression}"
+     → "Partition pruning is disabled. All partitions will be scanned."
+     → State which function is wrapping the partition column
+     → Show the correct rewrite: WHERE {partition_key} = '{value}'
+
+   - If no predicate references any partition key:
+     → "No partition filter applied."
+     → "All {n} known partitions will be scanned."
+     → If stats available: "Estimated full scan: {rows} rows, {size}"
+
+B. For insert-only transactional tables:
+   State explicitly:
+   "This table is insert-only (transactional_properties=insert_only).
+   DELETE, UPDATE, and MERGE are not supported at runtime even though
+   transactional=true. Only INSERT and SELECT are valid operations."
+
+C. For non-partitioned tables:
+   "This table is not partitioned. All rows will be read on every query."
+
+### Section 4 — Performance issues
+
+List every performance concern identified from HMS metadata.
+Use the same severity levels as optimize_query for consistency.
+
+CRITICAL issues (will cause full scans or runtime failures):
+- Non-sargable partition predicate (function on partition column)
+- Missing partition filter on a partitioned table
+- Write operation on an insert-only table (DELETE/UPDATE/MERGE)
+
+WARNING issues (avoidable inefficiency):
+- SELECT * on a wide table (include column count from HMS schema)
+- Suboptimal join order when HMS row counts confirm size mismatch
+- Implicit type cast in predicate (column type vs literal type from HMS)
+- No LIMIT on a large unrestricted scan (only if HMS stats confirm > 100M rows)
+- Missing ANALYZE TABLE (stats unavailable — quantitative reasoning is blocked)
+
+INFO observations:
+- Non-partitioned table being used in a large JOIN
+- Bucketing not aligned on join columns (from HMS table properties)
+- insert-only table queried with SELECT * (all delta files will be read)
+
+If no issues are found: state clearly
+  "No performance issues detected based on current HMS metadata."
+
+### Section 5 — Suggested optimizations
+
+For each issue in Section 4, provide a concrete fix in this format:
+
+  Issue   : {one-line description}
+  Fix     : {exact corrected HiveQL clause or expression}
+  Impact  : {estimated improvement if HMS stats available, otherwise qualitative}
+
+If HMS statistics are available and a partition filter fix is suggested,
+always include a before/after row estimate:
+  Impact: ~{N} rows after fix vs ~{M} rows without filter ({X}% reduction)
+
+If HMS statistics are unavailable:
+  Impact: Cannot estimate — run ANALYZE TABLE ... COMPUTE STATISTICS first.
+          Partition pruning will significantly reduce I/O once applied.
+
+Do not suggest HiveServer2 EXPLAIN, Tez DAG inspection, or any execution-based
+analysis. HiveMind reasons from HMS metadata only. EXPLAIN integration is
+future scope (see project roadmap).
+
+---
+
+## OUTPUT FORMAT
 
 Return the explanation in exactly this structure:
-
 QUERY EXPLANATION
 ═══════════════════════════════════════════════════════
 WHAT THIS QUERY DOES
-{2-4 sentences in plain English}
+{2–4 sentences, plain English}
 ───────────────────────────────────────────────────────
 TABLES AND DATA VOLUME
 {For each table:}
 {database}.{table}
-Type         : {Managed / External} | {ORC / Parquet / TextFile / Avro}
+Type        : {Managed / External} | {ORC / Parquet / TextFile / Avro}
 Transactional: {Full ACID / Insert-only / Non-transactional}
-Rows         : {from HMS stats, or "unknown - run ANALYZE TABLE"}
-Size         : {from HMS stats, or "unknown"}
-Partitioned  : {Yes - keys: {key list} / No}
-Partitions   : {sample values from get_partitions(), or "none found"}
+Rows        : {from HMS stats, or "unknown — run ANALYZE TABLE"}
+Size        : {from HMS stats, or "unknown"}
+Partitioned : {Yes — keys: {key list} / No}
+Partitions  : {sample values from get_partitions(), or "none found"}
 ───────────────────────────────────────────────────────
 PARTITION ANALYSIS
-{For each table, describe partition pruning or state that the table is not partitioned.}
+{For each partitioned table — see Step 3 Section 3 rules above}
 ───────────────────────────────────────────────────────
 PERFORMANCE ISSUES
 {n issue(s) found}
@@ -135,97 +240,84 @@ PERFORMANCE ISSUES
 SUGGESTED OPTIMIZATIONS
 {For each issue:}
 Issue  : {description}
-Fix    : {exact corrected HiveQL clause or expression}
-Impact : {quantitative if stats are available, qualitative if not}
+Fix    : {exact corrected HiveQL}
+Impact : {quantitative if stats available, qualitative if not}
 ───────────────────────────────────────────────────────
 STATISTICS NOTE
-{State whether HMS statistics are populated. If missing, provide exact ANALYZE
-TABLE statements using the real partition keys and sample partition values in
-the metadata. Do not use placeholders.}
+{One of:}
+A) Stats available:
+"HMS statistics are populated for this table. Row count estimates above
+are based on ANALYZE TABLE results stored in HMS."
+B) Stats missing:
+"HMS statistics are not yet computed for {database}.{table}.
+Row count and size estimates are unavailable. Run the following
+in Beeline or Hive CLI to populate them:
+ANALYZE TABLE {database}.{table}
+PARTITION ({partition_key})
+COMPUTE STATISTICS;
+ANALYZE TABLE {database}.{table}
+PARTITION ({partition_key} = '{most_recent_value}')
+COMPUTE STATISTICS FOR COLUMNS;
+Once run, re-ask HiveMind to explain this query for quantitative estimates."
 
 ---
 
-## ANALYSIS RULES
+## HARD RULES
 
-- Section 1 must be jargon-free and written for an analyst who understands SQL
-  but not Hive internals.
-- For partitioned tables, identify whether the query has a direct partition
-  filter, a function-wrapped/non-sargable partition predicate, or no partition
-  filter.
-- A direct equality or range predicate on a partition key enables partition
-  pruning.
-- A function around a partition key disables partition pruning. Show the exact
-  rewrite using the raw partition key.
-- If no partition key appears in the WHERE clause for a partitioned table, flag
-  a CRITICAL missing partition filter.
-- For insert-only tables, state that DELETE, UPDATE, and MERGE are not supported
-  at runtime even when transactional=true.
-- For SELECT * on a wide table, include the HMS column count.
-- If HMS stats are unavailable, do not provide row-count or size estimates.
-- Do not suggest HiveServer2 EXPLAIN, Tez DAG inspection, or any execution-based
-  analysis. HiveMind reasons from HMS metadata only.
-- Never confuse transactional=true with full ACID support. Always check
-  transactional_properties. insert_only means DELETE, UPDATE, and MERGE will
-  fail at runtime.
-- Do not repeat the same wording in PERFORMANCE ISSUES and SUGGESTED
-  OPTIMIZATIONS. Section 4 identifies; Section 5 fixes.
+- Never fabricate row counts, partition values, column types, or file sizes.
+  Every claim must come from an HMS tool result.
+
+- Never suggest query execution, EXPLAIN via HiveServer2, or Tez DAG analysis.
+  These are future scope. HiveMind reads HMS metadata only.
+
+- Never confuse transactional=true with full ACID support.
+  Always check transactional_properties. insert_only means DELETE/UPDATE/MERGE
+  will fail at runtime even if transactional=true is set.
+
+- If HMS statistics are unavailable, always include the exact ANALYZE TABLE
+  statements the user needs to run, using the actual partition key names and
+  sample partition values from get_partitions().
+  Never use generic placeholders like 'partition_key' or 'value' in the
+  final output shown to the user.
+
+- Keep the plain-English explanation in Section 1 jargon-free.
+  The target reader is an analyst who knows SQL but not Hive internals.
+  Reserve technical detail for Sections 3, 4, and 5.
+
+- Do not repeat the same issue across Section 4 and Section 5.
+  Section 4 identifies. Section 5 fixes. Keep them distinct.
 """
-
 
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
 
-async def handle_explain_query(client: "HMSClient", submitted_query: str) -> str:
+async def handle_explain_query(submitted_query: str, assembled_context: str) -> str:
     """
-    Explain any submitted HiveQL query against live HMS metadata.
+    Format HMS metadata context and a submitted HiveQL query into a structured
+    prompt that instructs the LLM to produce a plain-English explanation of
+    what the query does, where it may be slow, and how to improve it.
 
-    This is an analytical tool, not a generative or execution tool. It accepts
-    SELECT, DDL, and DML statements, fetches HMS metadata for referenced tables,
-    and returns a prompt that explains behavior, performance risks, and fixes.
+    Unlike handle_text_to_hiveql and handle_optimize_query, this handler accepts
+    any query type including DDL and DML — write operations are explained with a
+    note rather than blocked outright.
+
+    The caller must run search_tables, get_table_schema, get_partitions, and
+    get_table_stats first for every table in the query, then pass their combined
+    output as assembled_context.
     """
     try:
         if not submitted_query.strip():
             return "Error: submitted_query cannot be empty."
 
-        table_refs, unqualified = _extract_tables_from_sql(submitted_query)
-        if unqualified:
-            names = ", ".join(sorted(unqualified))
+        if not assembled_context.strip():
             return (
-                "Error: explain_query needs fully-qualified table names so it can "
-                "fetch the correct HMS metadata. Use database.table for: "
-                f"{names}."
+                "Error: assembled_context is empty. "
+                "Run search_tables, get_table_schema, get_partitions, and "
+                "get_table_stats first, then pass their combined output here."
             )
 
-        if not table_refs:
-            return (
-                "Error: no fully-qualified table references (database.table) found "
-                "in the query. Make sure the query includes a table such as "
-                "sample.sales_transactions."
-            )
-
-        context_parts: list[str] = []
-        not_found: list[str] = []
-
-        for db, tbl in table_refs:
-            schema = await handle_get_table_schema(client, db, tbl)
-            if schema.startswith("Error"):
-                not_found.append(f"{db}.{tbl}")
-                continue
-
-            partitions = await handle_get_partitions(client, db, tbl)
-            stats = await handle_get_table_stats(client, db, tbl)
-            context_parts.extend([schema, partitions, stats])
-
-        if not_found:
-            names = ", ".join(not_found)
-            return (
-                f"I couldn't find the following table(s) in the Hive Metastore: {names}. "
-                "Please check the table name and database, then try again."
-            )
-
-        assembled_context = "\n\n".join(context_parts)
         if _is_error_context(assembled_context):
             return (
                 "The table metadata lookup failed before the explanation could begin. "
@@ -246,14 +338,12 @@ async def handle_explain_query(client: "HMSClient", submitted_query: str) -> str
             include_footer=True,
         )
 
-        prompt = "\n\n".join(
-            [
-                _EXPLAIN_SYSTEM_PROMPT,
-                f"Submitted query:\n```sql\n{submitted_query.strip()}\n```",
-                hints,
-                "Full metastore context:\n" + clean_context.strip(),
-            ]
-        )
+        prompt = "\n\n".join([
+            _EXPLAIN_SYSTEM_PROMPT,
+            f"Submitted query:\n```sql\n{submitted_query.strip()}\n```",
+            hints,
+            "Full metastore context:\n" + clean_context.strip(),
+        ])
 
         return prompt
 

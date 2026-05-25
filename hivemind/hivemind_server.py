@@ -180,17 +180,18 @@ async def _tool_optimize_query(submitted_query: str) -> str:
 @mcp.tool(
     name="explain_query",
     description=(
-        "Explain what a HiveQL query does in plain English using live Hive Metastore "
-        "metadata. Use this whenever the user asks to explain a query; do not answer "
-        "from general LLM knowledge. Accepts any query type including SELECT, DDL, "
-        "and DML/write operations. This tool fetches schema, partitions, and statistics "
-        "for every fully-qualified table reference, reasons only from HMS metadata, "
-        "does not connect to HiveServer2, does not run EXPLAIN, and never executes "
-        "the submitted query."
+        "Explain what a HiveQL query does in plain English, identify where it may "
+        "be slow or expensive based on HMS metadata, and suggest concrete optimizations "
+        "— all without executing the query. "
+        "Works on any query type including SELECT, DDL, and DML. "
+        "Always call get_table_schema, get_partitions, and get_table_stats first "
+        "for every table in the query, then pass their combined output as assembled_context. "
+        "Reasons entirely from HMS metadata: schema, partition definitions, and statistics. "
+        "Does not connect to HiveServer2 and does not run EXPLAIN."
     ),
 )
-async def _tool_explain_query(submitted_query: str) -> str:
-    return await handle_explain_query(_require_client(), submitted_query)
+async def _tool_explain_query(submitted_query: str, assembled_context: str) -> str:
+    return await handle_explain_query(submitted_query, assembled_context)
 
 
 def main() -> None:
