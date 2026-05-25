@@ -23,6 +23,7 @@ from hivemind.tools.discovery import (  # noqa: E402
 )
 from hivemind.tools.sql_gen import handle_text_to_hiveql  # noqa: E402
 from hivemind.tools.optimize import handle_optimize_query  # noqa: E402
+from hivemind.tools.explain import handle_explain_query  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,11 +50,14 @@ mcp = FastMCP(
     instructions=(
         "HiveMind provides read-only Hive Metastore discovery tools. "
         f"Connected to HMS at {_HMS_HOST}:{_HMS_PORT}. "
-        "This server generates SELECT-only HiveQL queries. "
-        "If the user asks for a write operation (DELETE, INSERT, UPDATE, DROP, TRUNCATE, "
-        "ALTER, CREATE, MERGE, or any data modification), refuse immediately without "
-        "calling any tools or explaining how the operation would work. "
-        "For all other requests, fetch schema metadata before generating SQL queries."
+        "For query generation, this server generates SELECT-only HiveQL queries. "
+        "If the user asks to generate a write operation (DELETE, INSERT, UPDATE, DROP, "
+        "TRUNCATE, ALTER, CREATE, MERGE, or any data modification), refuse immediately "
+        "without calling tools or explaining how the operation would work. "
+        "For query optimization, only SELECT queries are supported. "
+        "For query explanation, always use explain_query with HMS metadata. "
+        "explain_query may explain SELECT, DDL, and DML statements, including write "
+        "operations, but HiveMind never executes them."
     ),
 )
 
@@ -171,6 +175,22 @@ async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> st
 )
 async def _tool_optimize_query(submitted_query: str) -> str:
     return await handle_optimize_query(_require_client(), submitted_query)
+
+
+@mcp.tool(
+    name="explain_query",
+    description=(
+        "Explain what a HiveQL query does in plain English using live Hive Metastore "
+        "metadata. Use this whenever the user asks to explain a query; do not answer "
+        "from general LLM knowledge. Accepts any query type including SELECT, DDL, "
+        "and DML/write operations. This tool fetches schema, partitions, and statistics "
+        "for every fully-qualified table reference, reasons only from HMS metadata, "
+        "does not connect to HiveServer2, does not run EXPLAIN, and never executes "
+        "the submitted query."
+    ),
+)
+async def _tool_explain_query(submitted_query: str) -> str:
+    return await handle_explain_query(_require_client(), submitted_query)
 
 
 def main() -> None:
