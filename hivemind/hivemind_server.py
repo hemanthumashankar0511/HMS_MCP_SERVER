@@ -93,7 +93,14 @@ async def _tool_list_tables(database: str) -> str:
     name="search_tables",
     description=(
         "Search for tables in the Hive Metastore whose name or column names contain "
-        "a keyword. If database is not specified, searches all databases."
+        "a keyword. "
+        "STRONGLY PREFER passing the 'database' argument to scope the search: an "
+        "unscoped search reads the schema of every table in every database and can "
+        "take many seconds on a large metastore. First call list_databases to find "
+        "the relevant database, then search within it. "
+        "If you already know the table name, skip search entirely and call "
+        "list_tables then get_table_schema directly — that is far faster than an "
+        "unscoped search."
     ),
 )
 async def _tool_search_tables(keyword: str, database: str = "") -> str:
@@ -203,7 +210,11 @@ def main() -> None:
     except Exception as exc:
         logger.error("Failed to connect to HMS: %s", exc)
         sys.exit(1)
-    mcp.run()
+    try:
+        mcp.run()
+    finally:
+        if _client is not None:
+            _client.close()
 
 
 if __name__ == "__main__":
