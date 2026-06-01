@@ -275,18 +275,21 @@ async def handle_optimize_query(client: "HMSClient", submitted_query: str) -> st
                 "Make sure the query uses the form database.table in the FROM or JOIN clause."
             )
 
-        # Fetch HMS metadata for every referenced table.
+        # Fetch HMS metadata for every referenced table. The request cache ensures
+        # each table's get_table is fetched once across schema/partitions/stats
+        # instead of 3+ separate round-trips.
         context_parts: list[str] = []
         not_found: list[str] = []
 
-        for db, tbl in table_refs:
-            schema = await handle_get_table_schema(client, db, tbl)
-            if schema.startswith("Error"):
-                not_found.append(f"{db}.{tbl}")
-                continue
-            partitions = await handle_get_partitions(client, db, tbl)
-            stats = await handle_get_table_stats(client, db, tbl)
-            context_parts.extend([schema, partitions, stats])
+        with client.request_cache():
+            for db, tbl in table_refs:
+                schema = await handle_get_table_schema(client, db, tbl)
+                if schema.startswith("Error"):
+                    not_found.append(f"{db}.{tbl}")
+                    continue
+                partitions = await handle_get_partitions(client, db, tbl)
+                stats = await handle_get_table_stats(client, db, tbl)
+                context_parts.extend([schema, partitions, stats])
 
         if not_found:
             names = ", ".join(not_found)

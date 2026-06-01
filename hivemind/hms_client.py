@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +82,33 @@ class HMSClient:
         self._timeout_ms = timeout_ms
         self._transport: TTransport.TBufferedTransport | None = None
         self._client: Any = None
+        # Guards transport access so the shared Thrift client cannot be corrupted
+        # by concurrent use. Non-reentrant is safe: _connect never calls _call.
+        self._lock = threading.Lock()
+        # Request-scoped memoization for get_table. None means caching is off;
+        # request_cache() turns it on for the duration of a single tool invocation
+        # so the same table is fetched from HMS only once. No cross-request staleness.
+        self._table_cache: dict[tuple[str, str], dict[str, Any]] | None = None
         self._connect()
+
+    @contextmanager
+    def request_cache(self) -> Iterator[None]:
+        """
+        Enable get_table memoization for the duration of the block.
+
+        Scoped to a single tool invocation: redundant get_table calls within the
+        same request (e.g. schema + partitions + stats for one table) hit the cache
+        instead of the network. Nested uses share the outermost cache, and the cache
+        is always cleared on exit, so no result is ever reused across requests.
+        """
+        created = self._table_cache is None
+        if created:
+            self._table_cache = {}
+        try:
+            yield
+        finally:
+            if created:
+                self._table_cache = None
 
     def _connect(self) -> None:
         try:
@@ -106,23 +135,17 @@ class HMSClient:
 
     def _call(self, fn_name: str, *args: Any) -> Any:
         """Calls a Thrift method, retrying once on transport failure."""
-        try:
-            return getattr(self._client, fn_name)(*args)
-        except TTransportException:
-            logger.warning("Transport error on %s - reconnecting", fn_name)
-            self._connect()
-            return getattr(self._client, fn_name)(*args)
+        with self._lock:
+            try:
+                return getattr(self._client, fn_name)(*args)
+            except TTransportException:
+                logger.warning("Transport error on %s - reconnecting", fn_name)
+                self._connect()
+                return getattr(self._client, fn_name)(*args)
 
     def close(self) -> None:
         if self._transport and self._transport.isOpen():
             self._transport.close()
-
-    def ping(self) -> bool:
-        try:
-            self._call("get_all_databases")
-            return True
-        except Exception:
-            return False
 
     def get_all_databases(self) -> list[str]:
         return sorted(self._call("get_all_databases"))
@@ -177,7 +200,14 @@ class HMSClient:
         (HMS 3.0+), plain get_table_req (some 3.x configs), then the legacy get_table
         API (HMS 2.x). Returns a dict with columns, partition_keys, storage info, and
         sanitized table properties (credentials are redacted).
+
+        When request_cache() is active, the result is memoized per (database, table)
+        so repeated lookups within one tool invocation avoid extra HMS round-trips.
         """
+        cache_key = (database, table)
+        if self._table_cache is not None and cache_key in self._table_cache:
+            return self._table_cache[cache_key]
+
         tbl = self._fetch_table_with_fallbacks(database, table)
         sd = tbl.sd
         raw_params: dict[str, str] = dict(tbl.parameters or {})
@@ -197,7 +227,7 @@ class HMSClient:
         cols = [_field_to_dict(c) for c in (sd.cols if sd else [])]
         part_keys = [_field_to_dict(k) for k in (tbl.partitionKeys or [])]
 
-        return {
+        info = {
             "name": tbl.tableName or "",
             "database": tbl.dbName or "",
             "table_type": tbl.tableType or "",
@@ -212,6 +242,9 @@ class HMSClient:
             "num_rows": raw_params.get("numRows", "-1"),
             "total_size": raw_params.get("totalSize", "-1"),
         }
+        if self._table_cache is not None:
+            self._table_cache[cache_key] = info
+        return info
 
     def get_partition_names(self, database: str, table: str, max_parts: int = 20) -> list[str]:
         """
@@ -237,6 +270,42 @@ class HMSClient:
             "total_size": params.get("totalSize", "-1"),
         }
 
+    def get_partition_basic_stats_bulk(
+        self,
+        database: str,
+        table: str,
+        partition_names: list[str],
+        partition_key_names: list[str],
+    ) -> dict[str, dict[str, str]]:
+        """
+        Fetch BASIC_STATS for many partitions in a single HMS round-trip.
+
+        Uses get_partitions_by_names instead of one get_partition_by_name call per
+        partition, collapsing N network round-trips into one. Returns a mapping of
+        {partition_name: {num_rows, num_files, total_size}} keyed by the canonical
+        'key=value/...' name reconstructed from each partition's values.
+
+        Names whose values contain characters HMS escapes in partition-name form may
+        not match the input names; callers should fall back to get_partition_basic_stats
+        for any requested name missing from the returned mapping.
+        """
+        names = list(partition_names)
+        if not names:
+            return {}
+        parts = self._call("get_partitions_by_names", database, table, names)
+        out: dict[str, dict[str, str]] = {}
+        for p in parts:
+            name = "/".join(
+                f"{k}={v}" for k, v in zip(partition_key_names, p.values or [])
+            )
+            params = dict(p.parameters or {})
+            out[name] = {
+                "num_rows": params.get("numRows", "-1"),
+                "num_files": params.get("numFiles", "-1"),
+                "total_size": params.get("totalSize", "-1"),
+            }
+        return out
+
     def get_table_stats(self, database: str, table: str) -> dict[str, Any]:
         """Fetch table statistics. Uses capability-aware get_table internally."""
         info = self.get_table(database, table)
@@ -258,14 +327,44 @@ class HMSClient:
             "last_modified": last_modified,
         }
 
+    def get_table_objects(self, database: str, tables: list[str]) -> dict[str, Any]:
+        """
+        Bulk-fetch raw Thrift Table objects for many tables in one round-trip.
+
+        Uses get_table_objects_by_name (batched) instead of one get_table call per
+        table. Returns {table_name: Table} for tables that could be fetched; tables
+        that fail are simply omitted (matching the per-table skip-on-error behavior).
+        Falls back to per-table fetch for any batch where the bulk API is unavailable,
+        so results are identical regardless of HMS version.
+        """
+        out: dict[str, Any] = {}
+        if not tables:
+            return out
+        batch = 200
+        for i in range(0, len(tables), batch):
+            chunk = tables[i:i + batch]
+            try:
+                objs = self._call("get_table_objects_by_name", database, chunk)
+                for o in objs:
+                    if o.tableName:
+                        out[o.tableName] = o
+            except Exception:
+                for t in chunk:
+                    try:
+                        out[t] = self._fetch_table_with_fallbacks(database, t)
+                    except Exception:
+                        pass
+        return out
+
     def search_tables(self, keyword: str, database: str | None = None) -> list[dict[str, str]]:
         """
         Search for tables whose name or column names contain keyword.
 
         Searches all databases unless database is specified. Name matches are cheap
-        (no Thrift fetch required); column matches incur one get_table_req call per
-        table and are capped at _SEARCH_TABLE_CAP schema fetches per database to
-        bound latency. Results are capped at 20 total matches.
+        (no Thrift fetch required); column matches read schema metadata that is
+        bulk-fetched once per database via get_table_objects_by_name, so column
+        scanning costs one round-trip per database instead of one per table.
+        Results are capped at 20 total matches.
         """
         kw = keyword.lower()
         databases = [database] if database else self.get_all_databases()
@@ -279,6 +378,12 @@ class HMSClient:
             except Exception:
                 continue
 
+            # Bulk-prefetch column metadata for tables that don't match by name, so the
+            # per-table loop below does column matching from memory (one round-trip per
+            # database) instead of a separate get_table call for every table.
+            to_fetch = [t for t in tables if kw not in t.lower()]
+            table_objs = self.get_table_objects(db, to_fetch) if to_fetch else {}
+
             for tbl_name in tables:
                 if len(results) >= 20:
                     break
@@ -290,20 +395,20 @@ class HMSClient:
                 schema_fetches_for_db = sum(1 for r in results if r["database"] == db)
                 if schema_fetches_for_db >= _SEARCH_TABLE_CAP:
                     continue
-                try:
-                    tbl_obj = self._fetch_table_with_fallbacks(db, tbl_name)
-                    sd = tbl_obj.sd
-                    col_names = [c.name.lower() for c in (sd.cols if sd else [])]
-                    part_key_names = [k.name.lower() for k in (tbl_obj.partitionKeys or [])]
-                    matched_col = next((c for c in col_names + part_key_names if kw in c), None)
-                    if matched_col:
-                        results.append({
-                            "database": db,
-                            "table": tbl_name,
-                            "match_reason": f"column '{matched_col}'",
-                        })
-                except Exception:
+
+                tbl_obj = table_objs.get(tbl_name)
+                if tbl_obj is None:
                     continue
+                sd = tbl_obj.sd
+                col_names = [c.name.lower() for c in (sd.cols if sd else [])]
+                part_key_names = [k.name.lower() for k in (tbl_obj.partitionKeys or [])]
+                matched_col = next((c for c in col_names + part_key_names if kw in c), None)
+                if matched_col:
+                    results.append({
+                        "database": db,
+                        "table": tbl_name,
+                        "match_reason": f"column '{matched_col}'",
+                    })
 
         return results
 

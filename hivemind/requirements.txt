@@ -1,5 +1,5 @@
-# HiveMind Phase 1 — Python dependencies
-# No LLM libraries — Phase 1 is pure HMS connectivity and MCP scaffolding.
+# HiveMind — Python dependencies
+# Runtime deps mirror pyproject.toml; pyproject.toml is the source of truth.
 
 # MCP server framework
 fastmcp>=2.0
@@ -10,6 +10,6 @@ python-dotenv>=1.0.0
 # Apache Thrift (Hive Metastore wire protocol)
 thrift>=0.16.0
 
-# Testing
-pytest>=7.0
+# Testing (see the "dev" optional-dependencies group in pyproject.toml)
+pytest>=8.0
 pytest-asyncio>=0.23

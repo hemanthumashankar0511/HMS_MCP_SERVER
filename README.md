@@ -4,7 +4,7 @@ HiveMind is an MCP (Model Context Protocol) server that exposes Apache Hive Meta
 
 ## Prerequisites
 
-- Python **3.14.4** (only version supported for this release)
+- Python **3.11+**
 - Access to HMS on port 9083 (no Kerberos required for dev cluster)
 - Cursor with Agent mode enabled
 - Thrift bindings already generated under `gen-py/`
@@ -55,7 +55,7 @@ PYTHONPATH=.:gen-py python hivemind/hivemind_server.py
 
 You should see:
 ```text
-HiveMind Phase 1 — MCP server started. Connecting to HMS at <YOUR_HOST>:9083
+Connecting to HMS at <YOUR_HOST>:9083
 HMS connection established.
 ```
 
@@ -72,6 +72,9 @@ HMS connection established.
    - `get_table_stats`
    - `get_partitions`
    - `get_table_ddl`
+   - `text_to_hiveql`
+   - `optimize_query`
+   - `explain_query`
 
 ## Security notes
 
