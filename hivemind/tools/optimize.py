@@ -9,6 +9,12 @@ from hivemind.tools.discovery import (
     handle_get_table_schema,
     handle_get_table_stats,
 )
+from hivemind.tools.explain_plan import (
+    max_hms_total_rows,
+    pick_focus_table,
+    hms_rows_for_table,
+    partition_keys_for_table,
+)
 from hivemind.tools.sql_gen import (
     _build_hints,
     _is_error_context,
@@ -21,8 +27,14 @@ from hivemind.tools.sql_gen import (
 
 if TYPE_CHECKING:
     from hivemind.hms_client import HMSClient
+    from hivemind.hs2_client import HS2Client
 
 logger = logging.getLogger(__name__)
+
+# Note appended when HS2 is not configured/reachable for optimize_query.
+_HS2_UNAVAILABLE_NOTE = (
+    "HS2 EXPLAIN CBO unavailable — optimization based on HMS metadata only."
+)
 
 # ---------------------------------------------------------------------------
 # SQL table extraction
@@ -32,20 +44,57 @@ _TABLE_REF_RE = re.compile(
     r"\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)",
     re.IGNORECASE,
 )
+_FROM_CLAUSE_RE = re.compile(
+    r"\bFROM\s+(.+?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bLIMIT\b|\bUNION\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TABLE_IN_FRAGMENT_RE = re.compile(
+    r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)",
+)
+
+
+def _tables_in_from_clause(from_part: str) -> list[tuple[str, str]]:
+    """
+    Extract db.table references from a FROM clause fragment.
+
+    Handles comma-joins and JOIN chains but ignores alias.column references
+    in ON clauses (e.g. o.cust_id = c.id).
+    """
+    tables: list[tuple[str, str]] = []
+    for join_seg in re.split(r"\bJOIN\b", from_part, flags=re.IGNORECASE):
+        # Strip ON ... predicates — they contain alias.column, not db.table sources.
+        source_part = re.split(r"\bON\b", join_seg, maxsplit=1, flags=re.IGNORECASE)[0]
+        for piece in source_part.split(","):
+            m = _TABLE_IN_FRAGMENT_RE.match(piece.strip())
+            if m:
+                tables.append((m.group(1), m.group(2)))
+    return tables
 
 
 def _extract_tables_from_sql(sql: str) -> list[tuple[str, str]]:
     """
     Return a deduplicated list of (database, table) pairs referenced in a SQL query.
-    Matches db.table patterns that follow FROM or JOIN keywords.
+
+    Matches db.table after FROM/JOIN, and comma-separated sources in the FROM
+    clause (legacy Hive comma-join syntax).
     """
     seen: set[tuple[str, str]] = set()
     result: list[tuple[str, str]] = []
-    for db, tbl in _TABLE_REF_RE.findall(sql):
+
+    def _add(db: str, tbl: str) -> None:
         key = (db.lower(), tbl.lower())
         if key not in seen:
             seen.add(key)
             result.append((db, tbl))
+
+    for db, tbl in _TABLE_REF_RE.findall(sql):
+        _add(db, tbl)
+
+    m = _FROM_CLAUSE_RE.search(sql)
+    if m:
+        for db, tbl in _tables_in_from_clause(m.group(1)):
+            _add(db, tbl)
+
     return result
 
 
@@ -58,6 +107,12 @@ _ANTIPATTERN_RULES = """\
 
 Analyze only what HMS metadata confirms. Never invent schema, partition keys,
 column types, or row counts. If a value is unknown, say so and skip that check.
+
+When an "HS2 EXPLAIN context:" block is provided below, treat it as primary
+evidence for row counts and partition pruning — even when HMS statistics are
+unavailable. Cite the CBO TableScan "Est. Rows" and "CBO SCAN ESTIMATES" figures
+directly in Impact and SUMMARY. Do NOT write "unknown" when the HS2 block contains
+actual row numbers.
 
 ### CRITICAL
 
@@ -145,8 +200,10 @@ ISSUES FOUND: {n}
 Problem  : {one sentence — what is wrong and why it matters}
 Detected : {exact clause or expression from the submitted query}
 Fix      : {corrected clause or expression}
-Impact   : {estimated row reduction if HMS stats available,
-otherwise "unknown — run ANALYZE TABLE ... COMPUTE STATISTICS"}
+Impact   : {REQUIRED: cite CBO TableScan row count from HS2 EXPLAIN context for the
+current query, e.g. "store_sales scans 287,997,024 rows (full partition scan)".
+For the suggested fix, estimate qualitatively or note "re-run with partition filter
+to measure reduction". If HS2 unavailable AND HMS stats unavailable, say "unknown".}
 [WARNING] {Issue title}
 Problem  : {one sentence}
 Detected : {exact clause}
@@ -158,10 +215,11 @@ OPTIMIZED REWRITE
 {Full corrected HiveQL query — same result, better performance}
 ───────────────────────────────────────────────────────
 SUMMARY
-Partition filter applied : {Yes / No / Partial — list which partition keys are covered}
-Estimated rows before    : {from HMS stats, or "unknown — run ANALYZE TABLE"}
-Estimated rows after     : {calculated from partition stats, or "unknown"}
-Estimated reduction      : {percentage, or "unknown"}
+Partition filter applied : {Yes / No / Partial — from HS2 plan or query analysis}
+Estimated rows scanned   : {CBO TableScan rows from HS2 EXPLAIN for focus table, e.g. "287,997,024 store_sales + 2,000,000 customer"}
+Partition pruning        : {yes/no — from HS2 EXPLAIN}
+Suggested fix impact     : {qualitative, e.g. "adding ss_sold_date_sk filter should reduce store_sales scan to single partition"}
+HMS stats note           : {only if HMS stats unavailable: "run ANALYZE TABLE ... for table-level totals"}
 
 If no anti-patterns are found after full analysis, skip the ISSUES and OPTIMIZED
 REWRITE sections and respond with:
@@ -219,7 +277,15 @@ any additional discovery tools.
 ## HARD RULES
 
 - Never invent schema, partition keys, column types, or row counts.
-  Every claim must come from the HMS metadata provided below.
+  Every claim must come from HMS metadata or the HS2 EXPLAIN context below.
+
+- When the HS2 EXPLAIN context contains CBO TableScan row estimates, you MUST
+  cite them in Impact and SUMMARY — even if HMS statistics are unavailable.
+  HMS ANALYZE TABLE is only needed for table-level totals and reduction %;
+  EXPLAIN CBO row counts are valid without ANALYZE TABLE.
+
+- Only write "unknown" for row counts when BOTH HMS stats AND HS2 CBO estimates
+  are unavailable in the context provided below.
 
 - Never change the query's intent. The optimized rewrite must return
   identical results — only performance characteristics change.
@@ -232,11 +298,7 @@ any additional discovery tools.
   if the original query uses them. Do not drop the database prefix.
 
 - Do not use backticks. Write plain unquoted identifiers: database.table,
-  alias.column. This is consistent with how HiveMind generates all queries.
-
-- If HMS statistics are unavailable, omit all row count estimates.
-  State clearly: "run ANALYZE TABLE {{db}}.{{table}} COMPUTE STATISTICS
-  PARTITION (partition_key) to enable row count estimates."\
+  alias.column. This is consistent with how HiveMind generates all queries.\
 """
 
 
@@ -245,7 +307,11 @@ any additional discovery tools.
 # ---------------------------------------------------------------------------
 
 
-async def handle_optimize_query(client: "HMSClient", submitted_query: str) -> str:
+async def handle_optimize_query(
+    client: "HMSClient",
+    submitted_query: str,
+    hs2_client: "HS2Client | None" = None,
+) -> str:
     """
     Optimize a submitted HiveQL SELECT query against live HMS metadata.
 
@@ -254,6 +320,11 @@ async def handle_optimize_query(client: "HMSClient", submitted_query: str) -> st
     instructs the LLM to produce a severity-ranked optimization report.
 
     No pre-fetched context is required — all HMS lookups happen inside this handler.
+
+    When hs2_client is provided and available, the handler also runs EXPLAIN against
+    HiveServer2 (no data execution) and includes the parsed CBO plan — row estimates,
+    partition pruning verdict — as evidence for the LLM to cite in the report.
+    HS2 failures degrade gracefully to HMS-only analysis.
     """
     try:
         if not submitted_query.strip():
@@ -320,11 +391,35 @@ async def handle_optimize_query(client: "HMSClient", submitted_query: str) -> st
             include_footer=True,
         )
 
+        # HS2 enrichment: run EXPLAIN on the submitted query and include the parsed
+        # CBO plan (row estimates per operator, partition pruning verdict) so the LLM
+        # can cite actual optimizer numbers in the Impact and SUMMARY lines.
+        focus_table = pick_focus_table(tables, pkeys) or (tables[0] if tables else None)
+        focus_hms_rows = (
+            hms_rows_for_table(rows, focus_table) if focus_table else max_hms_total_rows(rows)
+        )
+
+        if hs2_client is not None and hs2_client.is_available():
+            try:
+                hs2_report = hs2_client.explain_with_row_estimates(
+                    submitted_query,
+                    hms_total_rows=focus_hms_rows,
+                    table=focus_table,
+                    compact=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail optimize on HS2 error
+                logger.warning("HS2 EXPLAIN enrichment failed: %s", exc)
+                hs2_report = f"HS2 EXPLAIN failed: {exc}\n{_HS2_UNAVAILABLE_NOTE}"
+            hs2_block = "HS2 EXPLAIN context:\n" + hs2_report
+        else:
+            hs2_block = "HS2 EXPLAIN context:\n" + _HS2_UNAVAILABLE_NOTE
+
         prompt = "\n\n".join([
             _OPTIMIZE_SYSTEM_PROMPT,
             f"Submitted query:\n```sql\n{submitted_query.strip()}\n```",
             hints,
             "Full metastore context:\n" + clean_context.strip(),
+            hs2_block,
         ])
 
         return prompt

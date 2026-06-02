@@ -10,6 +10,9 @@ python-dotenv>=1.0.0
 # Apache Thrift (Hive Metastore wire protocol)
 thrift>=0.16.0
 
+# HiveServer2 client for optional EXPLAIN enrichment (no TCLIService stubs needed)
+pyhive[hive]>=0.7,<1.0
+
 # Testing (see the "dev" optional-dependencies group in pyproject.toml)
 pytest>=8.0
 pytest-asyncio>=0.23

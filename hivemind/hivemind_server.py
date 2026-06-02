@@ -12,6 +12,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / ".env")
 
 from hivemind.hms_client import HMSClient  # noqa: E402
+from hivemind.hs2_client import HS2Client  # noqa: E402
 from hivemind.tools.discovery import (  # noqa: E402
     handle_get_partitions,
     handle_get_table_ddl,
@@ -36,6 +37,15 @@ _HMS_HOST = (os.environ.get("HMS_HOST") or "").strip()
 _HMS_PORT = int((os.environ.get("HMS_PORT") or "9083").strip())
 _TIMEOUT_MS = int(os.environ.get("HMS_THRIFT_TIMEOUT_MS", "10000"))
 
+# HS2 is optional. When HS2_HOST is unset the server runs in HMS-only mode.
+_HS2_HOST = (os.environ.get("HS2_HOST") or "").strip()
+_HS2_PORT = int((os.environ.get("HS2_PORT") or "10000").strip())
+_HS2_USER = (os.environ.get("HS2_USER") or "").strip()
+_HS2_PASSWORD = os.environ.get("HS2_PASSWORD") or ""
+_HS2_DATABASE = (os.environ.get("HS2_DATABASE") or "default").strip()
+_HS2_AUTH = (os.environ.get("HS2_AUTH") or "NONE").strip().upper()
+_HS2_QUERY_TIMEOUT_S = int((os.environ.get("HS2_QUERY_TIMEOUT_S") or "60").strip())
+
 if not _HMS_HOST:
     logger.error(
         "HMS_HOST is not set. Add it to %s or export it in the environment (see README).",
@@ -44,20 +54,31 @@ if not _HMS_HOST:
     sys.exit(1)
 
 _client: HMSClient | None = None
+_hs2_client: HS2Client | None = None
+
+_hs2_instruction = (
+    f"HiveServer2 EXPLAIN is enabled (HS2 at {_HS2_HOST}:{_HS2_PORT}). "
+    "explain_query and optimize_query run EXPLAIN / EXPLAIN CBO via HS2 to obtain "
+    "the optimizer plan, CBO row estimates, and partition-pruning verification. "
+    "EXPLAIN only produces plan text — user data is never read or returned. "
+    if _HS2_HOST
+    else "HiveServer2 is not configured; analysis uses HMS metadata only. "
+)
 
 mcp = FastMCP(
     name="hivemind",
     instructions=(
         "HiveMind provides read-only Hive Metastore discovery tools. "
         f"Connected to HMS at {_HMS_HOST}:{_HMS_PORT}. "
-        "For query generation, this server generates SELECT-only HiveQL queries. "
+        + _hs2_instruction
+        + "For query generation, this server generates SELECT-only HiveQL queries. "
         "If the user asks to generate a write operation (DELETE, INSERT, UPDATE, DROP, "
         "TRUNCATE, ALTER, CREATE, MERGE, or any data modification), refuse immediately "
         "without calling tools or explaining how the operation would work. "
         "For query optimization, only SELECT queries are supported. "
         "For query explanation, always use explain_query with HMS metadata. "
         "explain_query may explain SELECT, DDL, and DML statements, including write "
-        "operations, but HiveMind never executes them."
+        "operations, but HiveMind never executes them — only EXPLAIN plans are run."
     ),
 )
 
@@ -175,34 +196,41 @@ async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> st
         "a structured report with severity-ranked issues and a corrected rewrite. "
         "HMS metadata (schema, partitions, statistics) is fetched automatically "
         "for every table in the query — no pre-fetched context is required. "
+        "When HiveServer2 is configured, EXPLAIN is run automatically on the "
+        "submitted query — the parsed CBO row estimates and partition-pruning "
+        "verdict are included as evidence for the LLM to cite in Impact and "
+        "Summary lines (EXPLAIN only — no data is executed or returned). "
         "Only SELECT queries are supported. Refuse write operations "
         "(DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, CREATE, MERGE) "
         "without calling any tools."
     ),
 )
 async def _tool_optimize_query(submitted_query: str) -> str:
-    return await handle_optimize_query(_require_client(), submitted_query)
+    return await handle_optimize_query(_require_client(), submitted_query, _hs2_client)
 
 
 @mcp.tool(
     name="explain_query",
     description=(
         "Explain what a HiveQL query does in plain English, identify where it may "
-        "be slow or expensive based on HMS metadata, and suggest concrete optimizations "
-        "— all without executing the query. "
+        "be slow or expensive, and suggest concrete optimizations — all without "
+        "executing the query. "
         "Works on any query type including SELECT, DDL, and DML. "
         "Always call get_table_schema, get_partitions, and get_table_stats first "
         "for every table in the query, then pass their combined output as assembled_context. "
-        "Reasons entirely from HMS metadata: schema, partition definitions, and statistics. "
-        "Does not connect to HiveServer2 and does not run EXPLAIN."
+        "Reasons from HMS metadata: schema, partition definitions, and statistics. "
+        "When HiveServer2 is configured, EXPLAIN CBO is run automatically for plan "
+        "analysis — CBO row estimates and partition-pruning verification (EXPLAIN "
+        "only — no data is executed or returned); the agent does not need to "
+        "pre-fetch any plan."
     ),
 )
 async def _tool_explain_query(submitted_query: str, assembled_context: str) -> str:
-    return await handle_explain_query(submitted_query, assembled_context)
+    return await handle_explain_query(submitted_query, assembled_context, _hs2_client)
 
 
 def main() -> None:
-    global _client
+    global _client, _hs2_client
     logger.info("Connecting to HMS at %s:%d", _HMS_HOST, _HMS_PORT)
     try:
         _client = HMSClient(_HMS_HOST, _HMS_PORT, _TIMEOUT_MS)
@@ -210,11 +238,37 @@ def main() -> None:
     except Exception as exc:
         logger.error("Failed to connect to HMS: %s", exc)
         sys.exit(1)
+
+    # HS2 is an optional enrichment layer. A missing host or a failed connection
+    # must NOT stop the server — it simply falls back to HMS-only analysis.
+    if _HS2_HOST:
+        logger.info("Connecting to HS2 at %s:%d", _HS2_HOST, _HS2_PORT)
+        try:
+            _hs2_client = HS2Client(
+                host=_HS2_HOST,
+                port=_HS2_PORT,
+                user=_HS2_USER,
+                password=_HS2_PASSWORD,
+                database=_HS2_DATABASE,
+                auth=_HS2_AUTH,
+                timeout_s=_HS2_QUERY_TIMEOUT_S,
+            )
+            logger.info("HS2 connection established — EXPLAIN enrichment enabled.")
+        except Exception as exc:
+            logger.warning(
+                "HS2 connection failed (%s). Continuing in HMS-only mode.", exc
+            )
+            _hs2_client = None
+    else:
+        logger.info("HS2_HOST not set — running in HMS-only mode (no EXPLAIN plans).")
+
     try:
         mcp.run()
     finally:
         if _client is not None:
             _client.close()
+        if _hs2_client is not None:
+            _hs2_client.close()
 
 
 if __name__ == "__main__":

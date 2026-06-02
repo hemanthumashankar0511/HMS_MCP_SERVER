@@ -30,6 +30,9 @@ dependencies = [
     "fastmcp>=2.0,<3.0",
     "thrift>=0.20,<1.0",
     "python-dotenv>=1.0,<2.0",
+    # Optional HS2 EXPLAIN enrichment. PyHive speaks the HiveServer2 protocol so we
+    # do not have to generate TCLIService Thrift stubs ourselves.
+    "pyhive[hive]>=0.7,<1.0",
 ]
 
 [project.optional-dependencies]

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
+from hivemind.tools.explain_plan import max_hms_total_rows
 from hivemind.tools.sql_gen import (
     _build_hints,
     _is_error_context,
@@ -11,7 +13,16 @@ from hivemind.tools.sql_gen import (
     _strip_backticks,
 )
 
+if TYPE_CHECKING:
+    from hivemind.hs2_client import HS2Client
+
 logger = logging.getLogger(__name__)
+
+# Note appended when HS2 is not configured/reachable so the LLM knows the analysis
+# rests on HMS metadata alone.
+_HS2_UNAVAILABLE_NOTE = (
+    "HS2 EXPLAIN unavailable — analysis based on HMS metadata only."
+)
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -92,6 +103,31 @@ For each table, in this exact order:
    - If stats return unknown: note this and skip all quantitative estimates.
      State: "Run ANALYZE TABLE {database}.{table} PARTITION ({key})
      COMPUTE STATISTICS to enable row count estimates."
+
+---
+
+## STEP 2b — HS2 EXPLAIN PLAN (when available)
+
+When HiveServer2 (HS2) is configured, HiveMind runs an EXPLAIN of the submitted
+query against HS2 and includes the parsed plan below under
+"HS2 EXPLAIN context:". EXPLAIN produces the optimizer's plan and CBO row
+estimates WITHOUT executing the query or returning any table data.
+
+Use the HS2 plan as your PRIMARY evidence — it reflects what the Hive optimizer
+will actually do, which is stronger than guessing from HMS metadata:
+
+- Partition pruning: trust the plan's "PARTITION PRUNING" verdict and the
+  TableScan filterExpr over a metadata-only guess. If the plan shows a partition
+  filter, pruning is confirmed; if it shows none on a partitioned table, all
+  partitions will be scanned.
+- Quantitative impact: use the CBO per-operator row estimates ("Est. Rows") and
+  the "ROW REDUCTION ESTIMATE" block for the rows-scanned and reduction figures.
+- Cross-check HMS metadata against the plan and FLAG MISMATCHES explicitly, e.g.
+  "HMS reports the table as partitioned, but the HS2 plan shows no partition
+  filter — pruning is not happening for this query."
+
+If the HS2 context says EXPLAIN is unavailable, fall back to HMS-only reasoning
+and say so. Never fabricate plan details that are not in the HS2 context.
 
 ---
 
@@ -197,13 +233,12 @@ If HMS statistics are available and a partition filter fix is suggested,
 always include a before/after row estimate:
   Impact: ~{N} rows after fix vs ~{M} rows without filter ({X}% reduction)
 
-If HMS statistics are unavailable:
+If HMS statistics are unavailable but the HS2 plan provides CBO estimates,
+use the CBO "Est. Rows" and "ROW REDUCTION ESTIMATE" figures for the impact.
+
+If neither HMS statistics nor HS2 CBO estimates are available:
   Impact: Cannot estimate — run ANALYZE TABLE ... COMPUTE STATISTICS first.
           Partition pruning will significantly reduce I/O once applied.
-
-Do not suggest HiveServer2 EXPLAIN, Tez DAG inspection, or any execution-based
-analysis. HiveMind reasons from HMS metadata only. EXPLAIN integration is
-future scope (see project roadmap).
 
 ---
 
@@ -224,6 +259,15 @@ Rows        : {from HMS stats, or "unknown — run ANALYZE TABLE"}
 Size        : {from HMS stats, or "unknown"}
 Partitioned : {Yes — keys: {key list} / No}
 Partitions  : {sample values from get_partitions(), or "none found"}
+───────────────────────────────────────────────────────
+HS2 PLAN ANALYSIS
+{Only populate from the "HS2 EXPLAIN context:" block below. If HS2 is
+unavailable, write: "HS2 EXPLAIN unavailable — analysis based on HMS
+metadata only." Otherwise report:}
+Partition pruning confirmed : {Yes / No — from the plan's PARTITION PRUNING verdict}
+Operator row estimates      : {key CBO Est. Rows from the plan, e.g. TableScan: 500}
+Row reduction               : {from ROW REDUCTION ESTIMATE, e.g. ~95.0% (10,000 → 500)}
+HMS vs plan cross-check     : {note any mismatch, or "consistent"}
 ───────────────────────────────────────────────────────
 PARTITION ANALYSIS
 {For each partitioned table — see Step 3 Section 3 rules above}
@@ -265,10 +309,11 @@ Once run, re-ask HiveMind to explain this query for quantitative estimates."
 ## HARD RULES
 
 - Never fabricate row counts, partition values, column types, or file sizes.
-  Every claim must come from an HMS tool result.
+  Every claim must come from an HMS tool result or the HS2 EXPLAIN context.
 
-- Never suggest query execution, EXPLAIN via HiveServer2, or Tez DAG analysis.
-  These are future scope. HiveMind reads HMS metadata only.
+- HiveMind may run EXPLAIN / EXPLAIN CBO via HiveServer2 to obtain the optimizer
+  plan and CBO row estimates. EXPLAIN never executes the query or returns table
+  data. Never suggest running the query itself or inspecting the live Tez DAG.
 
 - Never confuse transactional=true with full ACID support.
   Always check transactional_properties. insert_only means DELETE/UPDATE/MERGE
@@ -293,7 +338,11 @@ Once run, re-ask HiveMind to explain this query for quantitative estimates."
 # ---------------------------------------------------------------------------
 
 
-async def handle_explain_query(submitted_query: str, assembled_context: str) -> str:
+async def handle_explain_query(
+    submitted_query: str,
+    assembled_context: str,
+    hs2_client: "HS2Client | None" = None,
+) -> str:
     """
     Format HMS metadata context and a submitted HiveQL query into a structured
     prompt that instructs the LLM to produce a plain-English explanation of
@@ -306,6 +355,11 @@ async def handle_explain_query(submitted_query: str, assembled_context: str) -> 
     The caller must run search_tables, get_table_schema, get_partitions, and
     get_table_stats first for every table in the query, then pass their combined
     output as assembled_context.
+
+    When hs2_client is provided and available, the handler also runs an EXPLAIN
+    against HiveServer2 (no data execution) and appends the parsed plan, CBO row
+    estimates, and a row reduction estimate as additional evidence. HS2 failures
+    degrade gracefully to HMS-only analysis.
     """
     try:
         if not submitted_query.strip():
@@ -338,11 +392,29 @@ async def handle_explain_query(submitted_query: str, assembled_context: str) -> 
             include_footer=True,
         )
 
+        # HS2 enrichment: run EXPLAIN and merge HMS totals into the reduction block.
+        if hs2_client is not None and hs2_client.is_available():
+            hms_total = max_hms_total_rows(rows)
+            primary_table = tables[0] if tables else None
+            try:
+                hs2_report = hs2_client.explain_with_row_estimates(
+                    submitted_query,
+                    hms_total_rows=hms_total,
+                    table=primary_table,
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail explain on HS2 error
+                logger.warning("HS2 EXPLAIN enrichment failed: %s", exc)
+                hs2_report = f"HS2 EXPLAIN failed: {exc}\n{_HS2_UNAVAILABLE_NOTE}"
+            hs2_block = "HS2 EXPLAIN context:\n" + hs2_report
+        else:
+            hs2_block = "HS2 EXPLAIN context:\n" + _HS2_UNAVAILABLE_NOTE
+
         prompt = "\n\n".join([
             _EXPLAIN_SYSTEM_PROMPT,
             f"Submitted query:\n```sql\n{submitted_query.strip()}\n```",
             hints,
             "Full metastore context:\n" + clean_context.strip(),
+            hs2_block,
         ])
 
         return prompt
