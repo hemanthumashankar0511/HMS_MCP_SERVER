@@ -280,7 +280,17 @@ async def handle_get_table_schema(
 async def handle_get_table_stats(
     client: "HMSClient", database: str, table: str
 ) -> str:
-    # Share one fetch of the table across get_table_stats and the partition section.
+    """
+    Return HMS statistics for a table: table-level row count / size / file count,
+    plus a per-partition BASIC_STATS sample for partitioned tables.
+
+    When statistics are missing, the exact ANALYZE TABLE command needed to populate
+    them is shown. HiveMind never runs ANALYZE itself — it is a read-only discovery
+    tool, and ANALYZE launches a data-reading job that belongs in the user's Hive
+    client (Beeline / Hive CLI).
+    """
+    # request_cache() coalesces the two get_table lookups (stats + partition info)
+    # into a single HMS round-trip for the duration of this call.
     with client.request_cache():
         try:
             stats = client.get_table_stats(database, table)
@@ -289,7 +299,6 @@ async def handle_get_table_stats(
             return f"Error fetching stats for '{database}.{table}': {exc}"
 
         lines = [f"Statistics: {database}.{table}", "=" * 50, "Table-level BASIC_STATS:"]
-
         lines += [
             f"  Rows       : {_format_count(stats['num_rows'])}",
             f"  Total size : {_format_bytes(stats['total_size'])}",
@@ -304,9 +313,11 @@ async def handle_get_table_stats(
             logger.debug("get_table for partition stats failed: %s", exc)
             return "\n".join(lines)
 
+        part_keys = info.get("partition_keys", [])
+
         if not stats["stats_available"]:
             lines.append("")
-            if info.get("partition_keys"):
+            if part_keys:
                 lines.append(
                     "Table-level numRows absent in HMS. "
                     "Use the partition sample below for visibility, or run "
@@ -318,10 +329,11 @@ async def handle_get_table_stats(
                     f"Run ANALYZE TABLE {database}.{table} COMPUTE STATISTICS."
                 )
 
-        # Partitioned tables can have table-level and partition-level stats independently.
-        if info.get("partition_keys"):
+        # Partitioned tables can carry table-level and partition-level stats
+        # independently, so always show the partition sample when keys exist.
+        if part_keys:
             lines.append("")
-            part_key_names = [pk["name"] for pk in info["partition_keys"]]
+            part_key_names = [pk["name"] for pk in part_keys]
             _append_partition_basic_stats(lines, client, database, table, part_key_names)
 
         return "\n".join(lines)

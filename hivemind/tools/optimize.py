@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Note appended when HS2 is not configured/reachable for optimize_query.
 _HS2_UNAVAILABLE_NOTE = (
-    "HS2 EXPLAIN CBO unavailable — optimization based on HMS metadata only."
+    "HS2 EXPLAIN unavailable — optimization based on HMS metadata only."
 )
 
 # ---------------------------------------------------------------------------
@@ -215,11 +215,8 @@ OPTIMIZED REWRITE
 {Full corrected HiveQL query — same result, better performance}
 ───────────────────────────────────────────────────────
 SUMMARY
-Partition filter applied : {Yes / No / Partial — from HS2 plan or query analysis}
-Estimated rows scanned   : {CBO TableScan rows from HS2 EXPLAIN for focus table, e.g. "287,997,024 store_sales + 2,000,000 customer"}
-Partition pruning        : {yes/no — from HS2 EXPLAIN}
-Suggested fix impact     : {qualitative, e.g. "adding ss_sold_date_sk filter should reduce store_sales scan to single partition"}
-HMS stats note           : {only if HMS stats unavailable: "run ANALYZE TABLE ... for table-level totals"}
+Issues   : {n CRITICAL, m WARNING, k INFO}
+Main fix : {one sentence describing the most important change made}
 
 If no anti-patterns are found after full analysis, skip the ISSUES and OPTIMIZED
 REWRITE sections and respond with:
@@ -280,12 +277,12 @@ any additional discovery tools.
   Every claim must come from HMS metadata or the HS2 EXPLAIN context below.
 
 - When the HS2 EXPLAIN context contains CBO TableScan row estimates, you MUST
-  cite them in Impact and SUMMARY — even if HMS statistics are unavailable.
+  cite them in the Impact line of each issue — even if HMS statistics are unavailable.
   HMS ANALYZE TABLE is only needed for table-level totals and reduction %;
   EXPLAIN CBO row counts are valid without ANALYZE TABLE.
 
-- Only write "unknown" for row counts when BOTH HMS stats AND HS2 CBO estimates
-  are unavailable in the context provided below.
+- Only write "unknown" for row counts in Impact lines when BOTH HMS stats AND
+  HS2 CBO estimates are unavailable in the context provided below.
 
 - Never change the query's intent. The optimized rewrite must return
   identical results — only performance characteristics change.
@@ -391,10 +388,9 @@ async def handle_optimize_query(
             include_footer=True,
         )
 
-        # HS2 enrichment: run EXPLAIN on the submitted query and include the parsed
-        # CBO plan (row estimates per operator, partition pruning verdict) so the LLM
-        # can cite actual optimizer numbers in the Impact and SUMMARY lines.
-        focus_table = pick_focus_table(tables, pkeys) or (tables[0] if tables else None)
+        # HS2 enrichment: run EXPLAIN on the submitted query and include parsed
+        # row estimates and partition-pruning verdict for Impact lines.
+        focus_table = pick_focus_table(tables, pkeys)
         focus_hms_rows = (
             hms_rows_for_table(rows, focus_table) if focus_table else max_hms_total_rows(rows)
         )

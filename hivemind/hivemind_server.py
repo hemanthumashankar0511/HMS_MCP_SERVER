@@ -25,6 +25,7 @@ from hivemind.tools.discovery import (  # noqa: E402
 from hivemind.tools.sql_gen import handle_text_to_hiveql  # noqa: E402
 from hivemind.tools.optimize import handle_optimize_query  # noqa: E402
 from hivemind.tools.explain import handle_explain_query  # noqa: E402
+from hivemind.tools.compare import handle_compare_queries  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +59,7 @@ _hs2_client: HS2Client | None = None
 
 _hs2_instruction = (
     f"HiveServer2 EXPLAIN is enabled (HS2 at {_HS2_HOST}:{_HS2_PORT}). "
-    "explain_query and optimize_query run EXPLAIN / EXPLAIN CBO via HS2 to obtain "
+    "explain_query and optimize_query run EXPLAIN via HS2 to obtain "
     "the optimizer plan, CBO row estimates, and partition-pruning verification. "
     "EXPLAIN only produces plan text — user data is never read or returned. "
     if _HS2_HOST
@@ -78,7 +79,10 @@ mcp = FastMCP(
         "For query optimization, only SELECT queries are supported. "
         "For query explanation, always use explain_query with HMS metadata. "
         "explain_query may explain SELECT, DDL, and DML statements, including write "
-        "operations, but HiveMind never executes them — only EXPLAIN plans are run."
+        "operations, but HiveMind never executes them — only EXPLAIN plans are run. "
+        "When the user asks to compare two queries or wants to see before/after plan "
+        "metrics, use compare_queries — it runs EXPLAIN on both queries and returns "
+        "a side-by-side plan comparison with row reduction and partition pruning verdict."
     ),
 )
 
@@ -145,8 +149,8 @@ async def _tool_get_table_schema(database: str, table: str) -> str:
     description=(
         "Fetch table statistics from HMS: row count, total size, and number of files. "
         "For partitioned tables, returns table-level BASIC_STATS plus a sampled "
-        "partition-level BASIC_STATS section. Returns a warning if statistics have not "
-        "been computed."
+        "partition-level BASIC_STATS section. Returns the ANALYZE TABLE command to run "
+        "if statistics have not been computed."
     ),
 )
 async def _tool_get_table_stats(database: str, table: str) -> str:
@@ -219,7 +223,7 @@ async def _tool_optimize_query(submitted_query: str) -> str:
         "Always call get_table_schema, get_partitions, and get_table_stats first "
         "for every table in the query, then pass their combined output as assembled_context. "
         "Reasons from HMS metadata: schema, partition definitions, and statistics. "
-        "When HiveServer2 is configured, EXPLAIN CBO is run automatically for plan "
+        "When HiveServer2 is configured, EXPLAIN is run automatically for plan "
         "analysis — CBO row estimates and partition-pruning verification (EXPLAIN "
         "only — no data is executed or returned); the agent does not need to "
         "pre-fetch any plan."
@@ -227,6 +231,26 @@ async def _tool_optimize_query(submitted_query: str) -> str:
 )
 async def _tool_explain_query(submitted_query: str, assembled_context: str) -> str:
     return await handle_explain_query(submitted_query, assembled_context, _hs2_client)
+
+
+@mcp.tool(
+    name="compare_queries",
+    description=(
+        "Compare two HiveQL SELECT queries side-by-side using their EXPLAIN plans. "
+        "Runs EXPLAIN on both queries via HiveServer2, then produces a structured "
+        "report showing rows scanned before and after, partition pruning verdict, join "
+        "strategy changes, and a plain-English verdict on which query is more efficient. "
+        "HMS metadata (schema, partitions, statistics) is fetched automatically — "
+        "no pre-fetched context is required. "
+        "Use this when the user asks to compare two queries, wants to verify that an "
+        "optimized rewrite actually reduces I/O, or asks for a before/after plan analysis. "
+        "Requires HiveServer2 to be configured; degrades gracefully with a clear message "
+        "when HS2 is unavailable. "
+        "Only SELECT queries are supported."
+    ),
+)
+async def _tool_compare_queries(original_query: str, optimized_query: str) -> str:
+    return await handle_compare_queries(_require_client(), original_query, optimized_query, _hs2_client)
 
 
 def main() -> None:

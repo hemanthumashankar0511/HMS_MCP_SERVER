@@ -14,13 +14,6 @@ from hivemind.tools.explain_plan import (
 
 logger = logging.getLogger(__name__)
 
-# Modes accepted by explain(). Maps the friendly mode name to the EXPLAIN prefix.
-_EXPLAIN_PREFIXES: dict[str, str] = {
-    "CBO": "EXPLAIN CBO",
-    "EXTENDED": "EXPLAIN EXTENDED",
-    "PLAIN": "EXPLAIN",
-}
-
 _TRAILING_SEMICOLONS_RE = re.compile(r"[\s;]+$")
 
 _UNAVAILABLE_MSG = (
@@ -38,9 +31,9 @@ class HS2Client:
     """
     Thin PyHive wrapper for EXPLAIN-only HiveServer2 (HS2) operations.
 
-    This client never executes data-returning queries. It only issues EXPLAIN /
-    EXPLAIN CBO / EXPLAIN EXTENDED statements, which produce plan text and CBO row
-    estimates without reading table data. It is an optional enrichment layer on top
+    This client never executes data-returning queries. It only issues
+    EXPLAIN statements, which produce plan text and optimizer row estimates
+    without reading table data. It is an optional enrichment layer on top
     of the HMS discovery tools: if HS2 is unreachable the server runs HMS-only.
 
     Access is guarded by a lock so the shared PyHive connection cannot be corrupted
@@ -139,15 +132,9 @@ class HS2Client:
                     except Exception:  # noqa: BLE001
                         pass
 
-    def explain(self, query: str, mode: str = "CBO") -> str:
+    def explain(self, query: str) -> str:
         """
-        Run an EXPLAIN against HS2 and return the plan text as a single string.
-
-        mode:
-          - "CBO"      → EXPLAIN CBO {query}, falling back to EXPLAIN EXTENDED then
-                         plain EXPLAIN if CBO is unsupported for the statement.
-          - "EXTENDED" → EXPLAIN EXTENDED {query}
-          - "PLAIN"    → EXPLAIN {query}
+        Run EXPLAIN against HS2 and return the plan text as a single string.
 
         Trailing semicolons are stripped before wrapping. HS2 errors are returned as
         an "Error: ..." string rather than raised, so a plan failure never crashes
@@ -160,31 +147,19 @@ class HS2Client:
         if not bare:
             return "Error: empty query."
 
-        mode = mode.upper()
-        if mode == "CBO":
-            order = ["CBO", "EXTENDED", "PLAIN"]
-        elif mode in _EXPLAIN_PREFIXES:
-            order = [mode]
-        else:
-            order = ["PLAIN"]
-
-        last_error = ""
-        for m in order:
-            prefix = _EXPLAIN_PREFIXES[m]
-            statement = f"{prefix} {bare}"
-            try:
-                rows = self._execute_fetch(statement)
-                text = "\n".join(
-                    str(r[0]) if len(r) == 1 else "\t".join(str(c) for c in r)
-                    for r in rows
-                )
-                if text.strip():
-                    return text
-                last_error = f"{prefix} returned an empty plan"
-            except Exception as exc:  # noqa: BLE001 - graceful: never crash the server
-                last_error = str(exc)
-                logger.warning("%s failed: %s", prefix, exc)
-        return f"Error: {last_error or 'EXPLAIN produced no output'}"
+        statement = f"EXPLAIN {bare}"
+        try:
+            rows = self._execute_fetch(statement)
+            text = "\n".join(
+                str(r[0]) if len(r) == 1 else "\t".join(str(c) for c in r)
+                for r in rows
+            )
+            if text.strip():
+                return text
+            return "Error: EXPLAIN returned an empty plan"
+        except Exception as exc:  # noqa: BLE001 - graceful: never crash the server
+            logger.warning("EXPLAIN failed: %s", exc)
+            return f"Error: {exc}"
 
     def compare_explain_plans(
         self,
@@ -198,40 +173,18 @@ class HS2Client:
         Run EXPLAIN on two versions of a query and return a structured comparison.
 
         The report shows, side-by-side:
-          - CBO rows scanned before and after, with the percentage delta
+          - Optimizer row estimates before and after, with the percentage delta
           - Whether partition pruning is active in each plan
           - How much of the HMS total is scanned in each version
-          - Per-operator row estimates for both plans
           - A plain-English verdict (which plan is better and why)
-
-        This is the primary use case for HS2 EXPLAIN — not just describing one
-        query but producing optimizer-level evidence that the rewrite actually
-        reduces I/O, instead of reasoning from HMS metadata guesses alone.
-
-        Typical use cases
-        -----------------
-        1. Missing partition filter → filtered:
-               original:  SELECT * FROM t                  (full scan, all partitions)
-               optimized: SELECT * FROM t WHERE date = 'X' (one partition)
-
-        2. Non-sargable predicate → sargable:
-               original:  WHERE YEAR(sale_date) = 2026     (function on partition key → full scan)
-               optimized: WHERE sale_date LIKE '2026%'     (range push-down → pruned)
-
-        3. Suboptimal join order → corrected:
-               original:  large_table JOIN small_table     (shuffle join)
-               optimized: small_table JOIN large_table     (broadcast join)
-
-        HS2 errors on either plan degrade gracefully — the error text is included
-        in the report so the caller can see what the optimizer rejected.
         """
         if not self.is_available():
             return _UNAVAILABLE_MSG
 
         start = time.perf_counter()
 
-        orig_plan = self.explain(original_query, mode="PLAIN")
-        opt_plan = self.explain(optimized_query, mode="PLAIN")
+        orig_plan = self.explain(original_query)
+        opt_plan = self.explain(optimized_query)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         logger.info("compare_explain_plans HS2 EXPLAIN pair took %.0fms", elapsed_ms)
@@ -245,8 +198,6 @@ class HS2Client:
         opt_parsed = parse_explain_plan(opt_plan, partition_keys=partition_keys)
 
         return build_comparison_report(
-            original_plan=orig_plan,
-            optimized_plan=opt_plan,
             original_parsed=orig_parsed,
             optimized_parsed=opt_parsed,
             hms_total_rows=hms_total_rows,
@@ -260,24 +211,30 @@ class HS2Client:
         hms_total_rows: int | None = None,
         table: str | None = None,
         compact: bool = False,
+        partition_keys: list[str] | None = None,
     ) -> str:
         """
         Produce a structured HS2 EXPLAIN report with parsed row estimates.
 
-        Runs a plain EXPLAIN, which in Hive 3 carries CBO-costed per-operator
-        Statistics ('Num rows') and TableScan 'filterExpr' lines — exactly the
-        evidence needed to verify partition pruning and estimate rows scanned.
+        Runs EXPLAIN, which on Hive 3 carries optimizer Statistics ('Num rows')
+        and TableScan filterExpr lines — the evidence needed to verify partition
+        pruning and estimate rows scanned.
 
-        When hms_total_rows is supplied, a row reduction percentage (HMS total vs
-        CBO scan estimate) is included. HS2 errors degrade gracefully to a note.
+        When hms_total_rows is supplied and compact=False, a row reduction
+        percentage (HMS total vs scan estimate) is included.
+
+        partition_keys, when provided, enables metastore-level partition pruning
+        detection: Hive strips partition predicates from the runtime plan when it
+        resolves them during file-listing, so their absence from the FilterOperator
+        is used as evidence that pruning was applied.
         """
         if not self.is_available():
             return _UNAVAILABLE_MSG
 
         start = time.perf_counter()
-        plan = self.explain(query, mode="PLAIN")
+        plan = self.explain(query)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info("explain_query HS2 EXPLAIN took %.0fms", elapsed_ms)
+        logger.info("explain_with_row_estimates HS2 EXPLAIN took %.0fms", elapsed_ms)
 
         if plan.startswith("Error:"):
             return (
@@ -287,9 +244,8 @@ class HS2Client:
                 "Analysis falls back to HMS metadata only."
             )
 
-        parsed = parse_explain_plan(plan)
+        parsed = parse_explain_plan(plan, partition_keys=partition_keys)
         return build_hs2_report(
-            mode="EXPLAIN",
             plan_text=plan,
             parsed=parsed,
             hms_total_rows=hms_total_rows,

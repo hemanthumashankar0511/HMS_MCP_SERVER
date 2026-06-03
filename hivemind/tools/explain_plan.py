@@ -37,9 +37,6 @@ _OPERATOR_HEADERS = frozenset({"TableScan"})
 # How much raw plan text to keep in the report. Hive plans for wide joins can be
 # very large; we cap to keep the assembled prompt within a sane size.
 _PLAN_TEXT_CAP = 6000
-# Each plan in a side-by-side comparison gets a smaller cap so the combined
-# report stays within a sane prompt size.
-_PLAN_TEXT_CAP_COMPARISON = 3000
 
 
 def _clean_expr(expr: str) -> str:
@@ -152,6 +149,33 @@ def _finalize_parsed(
             if pk and pk in pred:
                 detected = True
                 break
+
+    # Metastore-level partition pruning detection.
+    #
+    # In Hive 3 on CDP, when a query has direct equality filters on partition keys,
+    # Hive resolves them during metastore file-listing (before plan generation).
+    # The partition predicates are stripped from the runtime FilterOperator — they
+    # never appear in the plan text even though pruning *is* active.
+    #
+    # Heuristic: if the caller provided partition keys, at least one non-partition
+    # runtime predicate exists in an operator, and none of those predicates mention
+    # any partition key, the partition predicates were consumed at the metastore
+    # level, which means pruning was applied.
+    if pkeys and not detected:
+        all_op_predicates = [op["filter"] for op in operators if op.get("filter")]
+        if all_op_predicates:
+            pk_in_runtime = any(
+                pk in pred
+                for pred in all_op_predicates
+                for pk in pkeys
+                if pk
+            )
+            if not pk_in_runtime:
+                detected = True
+                filters.append(
+                    "(inferred: partition predicates absent from runtime filter "
+                    "— applied at metastore level before plan generation)"
+                )
 
     ts_rows = [t["rows"] for t in table_scans if isinstance(t["rows"], int) and t["rows"] >= 0]
     # Dominant scan = largest TableScan (fact table in joins), not smallest.
@@ -336,18 +360,7 @@ def _row_delta_pct(before: int | None, after: int | None) -> str:
     return "0% (no change)"
 
 
-def _pruning_verdict(parsed: dict) -> str:
-    detected = parsed.get("partition_pruning_detected", False)
-    filters = parsed.get("partition_filters") or []
-    if detected:
-        f = "; ".join(filters) if filters else "yes (from filterExpr)"
-        return f"Yes — {f}"
-    return "No (full table scan)"
-
-
 def build_comparison_report(
-    original_plan: str,
-    optimized_plan: str,
     original_parsed: dict,
     optimized_parsed: dict,
     hms_total_rows: int | None = None,
@@ -449,8 +462,8 @@ def build_comparison_report(
             )
     else:
         lines.append(
-            "CBO row estimates could not be parsed from the plan text. "
-            "Check that EXPLAIN returned a CBO plan (Hive 3+)."
+            "Optimizer row estimates could not be parsed from the EXPLAIN plan. "
+            "TableScan Statistics lines may be missing for this statement shape."
         )
 
     if not pruning_before and pruning_after:
@@ -502,7 +515,6 @@ def format_cbo_scan_summary(parsed: dict, focus_table: str | None = None) -> str
 
 
 def build_hs2_report(
-    mode: str,
     plan_text: str,
     parsed: dict,
     hms_total_rows: int | None = None,
@@ -512,8 +524,11 @@ def build_hs2_report(
     """
     Assemble the structured HS2 EXPLAIN report block from a parsed plan.
 
-    When compact=True (used by optimize_query), omits the raw plan dump and leads
-    with a concise CBO scan summary the LLM can cite directly.
+    compact=True  — used by optimize_query: leads with a concise CBO scan summary
+                    for the LLM to cite in Impact lines; omits ROW REDUCTION ESTIMATE
+                    and the raw plan dump (the comparison feature handles reduction).
+    compact=False — used by explain_query: includes the full ROW REDUCTION ESTIMATE
+                    block and the raw plan text (capped at _PLAN_TEXT_CAP chars).
     """
     summary = format_cbo_scan_summary(parsed, table)
     detected = parsed.get("partition_pruning_detected", False)
@@ -523,7 +538,6 @@ def build_hs2_report(
     sections = [
         "HS2 EXPLAIN PLAN",
         "================",
-        f"Mode: {mode}",
         "",
         summary,
         "",
@@ -535,15 +549,18 @@ def build_hs2_report(
         "=================",
         f"Detected: {'yes' if detected else 'no'}",
         f"Filters: {filters_line}",
-        "",
-        "ROW REDUCTION ESTIMATE",
-        "======================",
     ]
-    if table:
-        sections.append(f"Table: {table}")
-    sections.append(compute_row_reduction(hms_total_rows, parsed.get("cbo_est_rows")))
 
     if not compact:
+        sections += [
+            "",
+            "ROW REDUCTION ESTIMATE",
+            "======================",
+        ]
+        if table:
+            sections.append(f"Table: {table}")
+        sections.append(compute_row_reduction(hms_total_rows, parsed.get("cbo_est_rows")))
+
         plan_display = plan_text.strip()
         if len(plan_display) > _PLAN_TEXT_CAP:
             plan_display = plan_display[:_PLAN_TEXT_CAP] + "\n... (plan truncated)"

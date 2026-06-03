@@ -98,7 +98,7 @@ async def test_optimize_includes_hs2_block_when_available():
 async def test_optimize_fallback_when_hs2_none():
     out = await handle_optimize_query(_FakeOptimizeClient(), _SELECT, None)
     assert "HS2 EXPLAIN context:" in out
-    assert "HS2 EXPLAIN CBO unavailable" in out
+    assert "HS2 EXPLAIN unavailable" in out
 
 
 async def test_optimize_blocks_writes_without_hs2_call():

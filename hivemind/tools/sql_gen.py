@@ -143,7 +143,9 @@ def _parse_columns_and_partitions(ctx: str) -> tuple[dict[str, list[str]], dict[
 
         col_name = parts[0]
         if in_section == "partitions":
-            pkeys.setdefault(current_table, []).append(col_name)
+            keys = pkeys.setdefault(current_table, [])
+            if col_name not in keys:
+                keys.append(col_name)
         elif _DATE_COL_RE.search(col_name):
             date_cols.setdefault(current_table, []).append(col_name)
 

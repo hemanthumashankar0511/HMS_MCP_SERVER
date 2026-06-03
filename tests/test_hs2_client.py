@@ -60,35 +60,28 @@ def test_is_available():
 def test_explain_joins_rows():
     conn = FakeConnection(rows=[("line1",), ("line2",), ("line3",)])
     c = _bare_hs2(conn)
-    out = c.explain("SELECT * FROM sample.t", mode="PLAIN")
+    out = c.explain("SELECT * FROM sample.t")
     assert out == "line1\nline2\nline3"
 
 
 def test_explain_strips_semicolons_and_wraps():
     conn = FakeConnection(rows=[("plan",)])
     c = _bare_hs2(conn)
-    c.explain("SELECT 1;;  ", mode="PLAIN")
+    c.explain("SELECT 1;;  ")
     assert conn.cursors[0].executed == ["EXPLAIN SELECT 1"]
-
-
-def test_explain_cbo_prefix():
-    conn = FakeConnection(rows=[("plan",)])
-    c = _bare_hs2(conn)
-    c.explain("SELECT 1", mode="CBO")
-    assert conn.cursors[0].executed == ["EXPLAIN CBO SELECT 1"]
 
 
 def test_explain_graceful_error():
     conn = FakeConnection(error=RuntimeError("hs2 boom"))
     c = _bare_hs2(conn)
-    out = c.explain("SELECT 1", mode="PLAIN")
+    out = c.explain("SELECT 1")
     assert out.startswith("Error")
     assert "boom" in out
 
 
 def test_explain_empty_query():
     c = _bare_hs2(FakeConnection(rows=[("x",)]))
-    assert c.explain("   ", mode="PLAIN").startswith("Error")
+    assert c.explain("   ").startswith("Error")
 
 
 def test_explain_unavailable_when_no_conn():
