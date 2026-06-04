@@ -59,7 +59,7 @@ table data through HS2. If HS2 is not configured, HiveMind runs in HMS-only mode
 
    # Optional — HiveServer2 EXPLAIN enrichment.
    # If HS2_HOST is unset, HiveMind runs in HMS-only mode (no EXPLAIN plans).
-   HS2_HOST=10.140.36.150
+   HS2_HOST=<HS2_HOST>
    HS2_PORT=10000
    HS2_USER=<username>      # the user you log in as (e.g. the cluster login user)
    HS2_PASSWORD=            # leave empty if the dev cluster has no auth
