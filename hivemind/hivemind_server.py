@@ -82,7 +82,23 @@ mcp = FastMCP(
         "operations, but HiveMind never executes them — only EXPLAIN plans are run. "
         "When the user asks to compare two queries or wants to see before/after plan "
         "metrics, use compare_queries — it runs EXPLAIN on both queries and returns "
-        "a side-by-side plan comparison with row reduction and partition pruning verdict."
+        "a side-by-side plan comparison with row reduction and partition pruning verdict. "
+        # ── Execution & terminal guardrail ───────────────────────────────────
+        # HiveMind tools return text (generated SQL, analysis reports). The agent
+        # MUST return that text to the user as produced. It MUST NOT use the
+        # terminal/shell or any external program for ANY part of answering — not to
+        # execute a query, not to fetch rows, and not for auxiliary computation such
+        # as date-to-surrogate-key conversion or partition-value derivation. All
+        # required values come from the metastore (get_partitions, date_dim, etc.).
+        "CRITICAL: HiveMind is a read-only metadata and query-generation tool. After "
+        "any tool returns, return its output directly to the user. Do NOT use the "
+        "terminal, shell, Python/python3, pyhive, or a Hive CLI for ANY part of the "
+        "task — not to execute queries, not to fetch results, and not for auxiliary "
+        "math like computing a date surrogate key. Never compute or guess a partition "
+        "key value: derive it from the metastore (a get_partitions sample value, or a "
+        "JOIN to date_dim filtered on its human-readable date column). Fetching live "
+        "results or running shell commands is outside HiveMind's scope and will fail "
+        "in sandboxed environments."
     ),
 )
 
@@ -186,7 +202,15 @@ async def _tool_get_table_ddl(database: str, table: str) -> str:
         "query. Always call get_table_schema (and get_partitions if partitioned) first, then "
         "pass those outputs as assembled_context. Do NOT call this tool for write operations "
         "(DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, CREATE, MERGE) — refuse those "
-        "requests directly without fetching any schema."
+        "requests directly without fetching any schema. "
+        "IMPORTANT: This tool returns generated HiveQL text. Return it directly to the user "
+        "as-is. Do NOT execute it and do NOT use the terminal for any part of the task — "
+        "no shell commands, no Python/python3 scripts, no pyhive, no Hive CLI — neither to "
+        "fetch rows nor for auxiliary math such as converting a calendar date into a "
+        "surrogate _date_sk partition key. Never compute a partition value: take it from a "
+        "get_partitions sample, or JOIN to date_dim and filter on its human-readable date "
+        "column. Query generation and query execution are separate concerns; this tool only "
+        "handles generation."
     ),
 )
 async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> str:
@@ -206,7 +230,10 @@ async def _tool_text_to_hiveql(natural_query: str, assembled_context: str) -> st
         "Summary lines (EXPLAIN only — no data is executed or returned). "
         "Only SELECT queries are supported. Refuse write operations "
         "(DELETE, INSERT, UPDATE, DROP, TRUNCATE, ALTER, CREATE, MERGE) "
-        "without calling any tools."
+        "without calling any tools. "
+        "IMPORTANT: This tool returns an analysis report and an optimized query rewrite. "
+        "Return the report directly to the user. Do NOT execute the original or "
+        "optimized query through any means — no shell, no Python, no pyhive."
     ),
 )
 async def _tool_optimize_query(submitted_query: str) -> str:
