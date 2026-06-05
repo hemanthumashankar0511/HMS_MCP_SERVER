@@ -25,7 +25,25 @@ Additional rules:
 1. Do not use backticks anywhere. Write plain unquoted identifiers: database.table, alias.column.
 2. Use only tables and columns that appear in the metastore context below.
 3. Filter on partition keys first in WHERE to avoid full table scans.
-4. Use short 1–2 letter aliases for tables in JOINs.\
+4. Use short 1–2 letter aliases for tables in JOINs.
+
+EXECUTION RULE — THIS IS MANDATORY:
+Output ONLY the SQL query in a ```sql block. After producing the query, STOP.
+Do NOT use the terminal, shell, or any external program for ANY part of answering —
+not to execute the query, not to fetch rows, and not for auxiliary computation such
+as date-to-surrogate-key conversion, Julian date math, or partition-value derivation.
+No shell commands, no Python/python3 scripts, no pyhive, no Hive CLI. Everything you
+need comes from the metastore context below.
+
+PARTITION VALUE RULE:
+Never compute or guess a partition key value. When the partition key is a surrogate
+(e.g. a column ending in _date_sk or _sk) and the question names a calendar date,
+do NOT calculate the surrogate key. Instead either:
+  (a) JOIN to the date dimension (e.g. date_dim) and filter on its human-readable
+      date column (e.g. d_date = '2026-05-11'), letting Hive resolve the key, or
+  (b) use a real partition value taken verbatim from the Partitions section below.
+Only use partition values that actually appear in the metastore context. If the
+requested date is not represented, say so rather than inventing a key.\
 """
 
 _QUERY_HINTS = """\

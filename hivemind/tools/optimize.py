@@ -295,7 +295,15 @@ any additional discovery tools.
   if the original query uses them. Do not drop the database prefix.
 
 - Do not use backticks. Write plain unquoted identifiers: database.table,
-  alias.column. This is consistent with how HiveMind generates all queries.\
+  alias.column. This is consistent with how HiveMind generates all queries.
+
+- EXECUTION GUARDRAIL: After producing the OPTIMIZED REWRITE, stop and return
+  the report to the user. Do NOT use the terminal/shell or any external program
+  for ANY part of the task — not to execute the original or optimized query, not
+  to fetch rows, and not for auxiliary math like computing a date surrogate key.
+  No shell commands, no Python/python3 scripts, no pyhive, no Hive CLI. Never
+  compute a partition value — derive it from the metastore context below.
+  HiveMind is a metadata and analysis tool only.\
 """
 
 

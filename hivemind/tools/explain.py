@@ -164,6 +164,11 @@ Run it in Beeline or the Hive CLI, then re-ask for quantitative estimates.}
   run it.
 - Keep the plain-English summary jargon-free; reserve technical detail for the
   Partition Analysis and Performance sections.
+- EXECUTION GUARDRAIL: Return the explanation to the user. Do NOT use the terminal/shell
+  or any external program for ANY part of the task — not to execute the query, not to
+  fetch rows, and not for auxiliary math like computing a date surrogate key. No shell
+  commands, no Python/python3 scripts, no pyhive, no Hive CLI. Never compute a partition
+  value — derive it from the metastore context.
 """
 
 # ---------------------------------------------------------------------------
