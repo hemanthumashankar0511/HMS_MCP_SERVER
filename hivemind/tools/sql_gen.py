@@ -81,14 +81,18 @@ def _parse_row_counts(ctx: str) -> dict[str, str]:
         Statistics: db.table
           Rows       : 1,234,567
 
-    For partitioned ACID tables, HMS may store stats only at the partition level
-    so the table-level Rows line reads "unknown".  handle_get_table_stats rolls up
-    partition stats and appends a sum line in that case:
+    For partitioned tables, HMS stores BASIC_STATS only at the partition level — the
+    table-level Rows line reads "unknown".  handle_get_table_stats then aggregates the
+    partitions and emits a "Derived table-level totals" block whose Rows line carries
+    the real total (with a "(from N/M partition(s))" suffix):
 
-        Sum(rows) over partitions with usable numRows (N partition(s)): 500
+        Derived table-level totals (...):
+          Rows      : 500  (from 3/3 partition(s))
 
-    When the Rows line is "unknown" we keep the current table context alive so the
-    subsequent Sum line can be captured and used as the effective row count.
+    Any Rows line with a leading integer is captured (trailing annotations are
+    ignored).  When the table-level Rows line is "unknown" (no digits) the current
+    table context is kept alive so the later derived Rows line supplies the count.
+    The legacy "Sum(rows) over partitions" line is still recognized for compatibility.
     """
     counts: dict[str, str] = {}
     current: str | None = None
@@ -99,13 +103,16 @@ def _parse_row_counts(ctx: str) -> dict[str, str]:
             continue
         if current and re.match(r"\s+Rows\s*:", line):
             raw = line.split(":", 1)[1].strip()
-            if raw not in ("-1", "", "N/A", "unknown"):
-                counts[current] = raw
-                current = None  # real value found; stop looking for rollup
-            # "unknown" → keep current alive so the partition rollup sum can follow
+            m_rows = re.match(r"([\d,]+)", raw)
+            if m_rows:
+                # Real value (table-level or derived rollup); stop looking further.
+                # Keep original comma formatting; downstream handles it.
+                counts[current] = m_rows.group(1)
+                current = None
+            # No leading digits (e.g. "unknown") → keep current alive so the derived
+            # rollup Rows line below can supply the effective count.
             continue
-        # Partition rollup summary emitted by handle_get_table_stats when table-level
-        # numRows is absent.  Only store if we haven't already found a real Rows value.
+        # Legacy partition rollup summary; only used if no Rows value was captured.
         if current and current not in counts:
             m_sum = re.match(r"\s+Sum\(rows\) over partitions.*:\s*([\d,]+)", line)
             if m_sum:

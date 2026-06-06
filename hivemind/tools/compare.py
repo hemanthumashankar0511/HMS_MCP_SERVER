@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from hivemind.tools.discovery import (
@@ -28,6 +29,52 @@ if TYPE_CHECKING:
     from hivemind.hs2_client import HS2Client
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers — partition filter extraction
+# ---------------------------------------------------------------------------
+
+def _extract_partition_filter_values(sql: str, partition_keys: list[str]) -> dict[str, str]:
+    """
+    Return {partition_key: literal_value} for equality predicates found in sql.
+
+    Handles both quoted and unquoted literals:
+      WHERE ss_sold_date_sk = 2450816
+      WHERE sale_date = '2026-05-11'
+    """
+    result: dict[str, str] = {}
+    for pk in partition_keys:
+        # Match  pk = value  or  pk = 'value'  (case-insensitive, spaces optional)
+        pattern = re.compile(
+            rf"\b{re.escape(pk)}\s*=\s*'?([^'\s,)(]+)'?",
+            re.IGNORECASE,
+        )
+        m = pattern.search(sql)
+        if m:
+            result[pk] = m.group(1).strip("'\"")
+    return result
+
+
+def _lookup_partition_sample_rows(context: str, pkey: str, value: str) -> int | None:
+    """
+    Find the HMS partition sample row count for a specific partition value.
+
+    Matches lines produced by get_partitions, e.g.:
+      ss_sold_date_sk=2450816  rows=88,103  files=1  size=3.1 MB
+      sale_date=2026-05-11  rows=500  files=1  size=7.7 KB
+    """
+    pattern = re.compile(
+        rf"\b{re.escape(pkey)}={re.escape(value)}\s+rows=([\d,]+)",
+        re.IGNORECASE,
+    )
+    m = pattern.search(context)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -232,12 +279,26 @@ async def handle_compare_queries(
             hms_rows_for_table(rows, focus_table) if focus_table else None
         ) or max_hms_total_rows(rows)
 
+        # For fetch-only plans (partition filter resolved at metastore level),
+        # the CBO emits no row estimate.  Resolve the partition filter value from
+        # the optimized query's WHERE clause and look it up in the HMS partition
+        # sample so the comparison table shows real numbers instead of "unknown".
+        partition_sample_rows: int | None = None
+        if focus_pkeys:
+            filter_vals = _extract_partition_filter_values(optimized_query, focus_pkeys)
+            for pk, val in filter_vals.items():
+                n = _lookup_partition_sample_rows(assembled_context, pk, val)
+                if n is not None:
+                    partition_sample_rows = n
+                    break
+
         comparison_report = hs2_client.compare_explain_plans(
             original_query=original_query,
             optimized_query=optimized_query,
             hms_total_rows=hms_total,
             table=focus_table,
             partition_keys=focus_pkeys,
+            partition_sample_rows=partition_sample_rows,
         )
 
         prompt = "\n\n".join([

@@ -162,8 +162,13 @@ def test_no_inferred_pruning_without_pkeys():
     assert parsed["partition_pruning_detected"] is False
 
 
-def test_no_inferred_pruning_when_no_runtime_filter():
-    """Heuristic must not fire when there are no runtime filter predicates at all."""
+def test_pure_fetch_plan_infers_pruning():
+    """
+    A CBO fetch-only plan (Fetch Operator, no Stage-1) with partition keys
+    signals metastore-level pruning even when no runtime predicates are present.
+    This is heuristic 2: the absence of a Map/Reduce stage is itself definitive
+    evidence that partition predicates were fully resolved at the metastore level.
+    """
     plan = """\
 Plan optimized by CBO.
 
@@ -173,7 +178,32 @@ Stage-0
       Output:["device_id"]
 """
     parsed = parse_explain_plan(plan, partition_keys=["location_zone"])
+    assert parsed["partition_pruning_detected"] is True
+    assert any("inferred" in f for f in parsed["partition_filters"])
+    assert parsed["is_fetch_plan"] is True
+
+
+def test_no_pruning_when_map_stage_present():
+    """
+    A plan that contains Stage-1 (Map/Reduce) is a full scan or complex execution
+    path.  Even if partition_keys are provided, heuristic 2 must NOT fire because
+    the Map stage means partition predicates were not fully resolved at the
+    metastore level.
+    """
+    plan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    limit:-1
+    Stage-1
+      Map 1
+        TableScan [TS_0]
+          Output:["device_id"]
+"""
+    parsed = parse_explain_plan(plan, partition_keys=["location_zone"])
     assert parsed["partition_pruning_detected"] is False
+    assert parsed["is_fetch_plan"] is False
 
 
 def test_no_inferred_pruning_when_pkey_present_in_filter():
@@ -188,6 +218,54 @@ TableScan
     assert parsed["partition_pruning_detected"] is True
     # Inferred note should NOT be added when the key is present in the explicit filter
     assert not any("inferred" in f for f in parsed["partition_filters"])
+
+
+def test_is_fetch_plan_false_for_legacy_plan():
+    """Legacy tree-format plans do not satisfy the pure-fetch criteria."""
+    parsed = parse_explain_plan(_PLAN)
+    assert parsed["is_fetch_plan"] is False
+
+
+def test_is_fetch_plan_false_for_cbo_plan_with_stage1():
+    """Full-scan CBO plans that have Stage-1 must not be classified as fetch-only."""
+    parsed = parse_explain_plan(_CBO_PLAN_FULL)
+    assert parsed["is_fetch_plan"] is False
+
+
+def test_is_fetch_plan_false_for_empty_plan():
+    parsed = parse_explain_plan("")
+    assert parsed["is_fetch_plan"] is False
+
+
+def test_is_fetch_plan_true_when_cbo_fetch_no_stage1():
+    plan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    Select Operator [SEL_2]
+      TableScan [TS_0]
+        Output:["col_a","col_b"]
+"""
+    parsed = parse_explain_plan(plan)
+    assert parsed["is_fetch_plan"] is True
+
+
+def test_bracketed_tablescan_recognised_as_operator_header():
+    """TableScan [TS_N] lines must be added to table_scans by the tree parser."""
+    plan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    TableScan [TS_0]
+      Output:["col_a"]
+"""
+    parsed = parse_explain_plan(plan)
+    # The operator is recorded (even though table/rows are None for a fetch plan).
+    assert any(
+        op.get("operator", "").startswith("TableScan") for op in parsed["operators"]
+    )
 
 
 def test_compute_row_reduction_math():
@@ -316,6 +394,96 @@ def test_comparison_report_unknown_rows():
     empty = parse_explain_plan("")
     report = build_comparison_report(empty, empty)
     assert "could not be parsed" in report.lower()
+
+
+def test_comparison_fetch_plan_verdict_without_partition_sample():
+    """
+    When partition_sample_rows is NOT supplied, the fetch-plan path should still
+    give a qualitative description instead of a bare 'unknown'.
+    """
+    full_scan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    limit:-1
+    Stage-1
+      Map 1 vectorized
+      TableScan [TS_0] (rows=287997024 width=1396)
+        tpcds_bin_partitioned_orc_100@store_sales,store_sales, ACID table,Tbl:COMPLETE,Col:PARTIAL,Output:["col_a"]
+"""
+    fetch_plan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    Select Operator [SEL_2]
+      TableScan [TS_0]
+        Output:["col_a"]
+"""
+    before = parse_explain_plan(full_scan)
+    after = parse_explain_plan(fetch_plan, partition_keys=["ss_sold_date_sk"])
+
+    assert before["cbo_est_rows"] == 287997024
+    assert after["cbo_est_rows"] is None
+    assert after["is_fetch_plan"] is True
+    assert after["partition_pruning_detected"] is True
+
+    report = build_comparison_report(
+        before,
+        after,
+        hms_total_rows=287_997_024,
+        table="tpcds_bin_partitioned_orc_100.store_sales",
+        partition_keys=["ss_sold_date_sk"],
+        # partition_sample_rows intentionally omitted
+    )
+    assert "fetch" in report.lower()
+    assert "287,997,024" in report
+    assert "pruning" in report.lower()
+
+
+def test_comparison_fetch_plan_verdict_with_partition_sample():
+    """
+    When partition_sample_rows IS supplied, the comparison table shows real
+    numbers and a proper row-reduction percentage instead of 'unknown'.
+    """
+    full_scan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    limit:-1
+    Stage-1
+      Map 1 vectorized
+      TableScan [TS_0] (rows=287997024 width=1396)
+        tpcds_bin_partitioned_orc_100@store_sales,store_sales, ACID table,Tbl:COMPLETE,Col:PARTIAL,Output:["col_a"]
+"""
+    fetch_plan = """\
+Plan optimized by CBO.
+
+Stage-0
+  Fetch Operator
+    Select Operator [SEL_2]
+      TableScan [TS_0]
+        Output:["col_a"]
+"""
+    before = parse_explain_plan(full_scan)
+    after = parse_explain_plan(fetch_plan, partition_keys=["ss_sold_date_sk"])
+
+    report = build_comparison_report(
+        before,
+        after,
+        hms_total_rows=287_997_024,
+        table="tpcds_bin_partitioned_orc_100.store_sales",
+        partition_keys=["ss_sold_date_sk"],
+        partition_sample_rows=88_103,
+    )
+    # Should show the actual partition row count
+    assert "88,103" in report
+    # And a meaningful reduction percentage
+    assert "-" in report  # some % reduction shown
+    assert "HMS" in report  # source label present
+    assert "pruning" in report.lower()
 
 
 def test_comparison_hms_total_shows_vs_savings():

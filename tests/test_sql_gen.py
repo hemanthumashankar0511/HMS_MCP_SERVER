@@ -46,6 +46,20 @@ Table-level BASIC_STATS:
   Sum(rows) over partitions with usable numRows (3 partition(s)): 500
 """
 
+_STATS_DERIVED_CTX = """\
+Statistics: sales.orders
+==================================================
+Table-level BASIC_STATS:
+  Rows       : unknown
+  Total size : unknown
+  Files      : unknown
+
+Derived table-level totals (aggregated from partition BASIC_STATS; ...):
+  Rows      : 1,500  (from 3/3 partition(s))
+  Total size: 6.0 KB  (from 3/3 partition(s))
+  Files     : 9  (from 3/3 partition(s))
+"""
+
 
 def test_parse_tables():
     assert _parse_tables(_SCHEMA_CTX) == ["sales.orders"]
@@ -59,6 +73,12 @@ def test_parse_row_counts_real_value():
 def test_parse_row_counts_partition_rollup():
     # When the table-level Rows line is "unknown", the partition rollup sum is used.
     assert _parse_row_counts(_STATS_ROLLUP_CTX) == {"sales.orders": "500"}
+
+
+def test_parse_row_counts_derived_totals():
+    # The derived "Rows : N (from .../...)" line supplies the effective count when the
+    # table-level Rows line reads "unknown"; the trailing annotation is ignored.
+    assert _parse_row_counts(_STATS_DERIVED_CTX) == {"sales.orders": "1,500"}
 
 
 def test_parse_columns_and_partitions():
