@@ -237,3 +237,50 @@ def test_search_tables_name_and_column_match_via_bulk():
         {"database": "sales_db", "table": "sales_summary", "match_reason": "table name"},
         {"database": "sales_db", "table": "inventory", "match_reason": "column 'sales_amount'"},
     ]
+
+
+def test_search_tables_global_cap_is_30():
+    """Global result cap must be exactly 30."""
+    c = _bare_client()
+    c.get_all_databases = lambda: ["db"]
+    c.get_all_tables = lambda db: [f"match_t{i}" for i in range(50)]
+
+    def fake_call(fn, dbname, names):
+        return []  # no column matches needed — all tables match by name
+
+    c._call = fake_call
+    results = c.search_tables("match")
+    assert len(results) == 30
+    assert all(r["match_reason"] == "table name" for r in results)
+
+
+def test_search_tables_scoped_returns_up_to_30_column_matches():
+    """Scoped single-db search should not apply the per-database column cap."""
+    c = _bare_client()
+    c.get_all_tables = lambda db: [f"t{i}" for i in range(40)]
+
+    def fake_call(fn, dbname, names):
+        return [_table_obj(n, [f"metric_{n}"]) for n in names]
+
+    c._call = fake_call
+    results = c.search_tables("metric", database="sales_db")
+    assert len(results) == 30
+    assert all(r["match_reason"].startswith("column") for r in results)
+
+
+def test_search_tables_unscoped_limits_column_matches_per_database():
+    """Unscoped search caps column matches at 20 per db, leaving slots for other dbs."""
+    c = _bare_client()
+    c.get_all_databases = lambda: ["db_a", "db_b"]
+    c.get_all_tables = lambda db: [f"{db}_t{i}" for i in range(25)]
+
+    def fake_call(fn, dbname, names):
+        return [_table_obj(n, ["shared_col"]) for n in names]
+
+    c._call = fake_call
+    results = c.search_tables("shared")
+    db_a = [r for r in results if r["database"] == "db_a"]
+    db_b = [r for r in results if r["database"] == "db_b"]
+    assert len(db_a) == 20  # capped at _SEARCH_COLUMN_MATCH_PER_DB
+    assert len(db_b) == 10  # remaining slots
+    assert len(results) == 30

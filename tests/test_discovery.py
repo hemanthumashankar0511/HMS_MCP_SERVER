@@ -1,3 +1,5 @@
+import contextlib
+
 from hivemind.tools.discovery import (
     _format_bytes,
     _format_count,
@@ -6,6 +8,7 @@ from hivemind.tools.discovery import (
     _stat_int,
     handle_get_partitions,
     handle_get_table_schema,
+    handle_get_table_stats,
     handle_list_databases,
 )
 
@@ -146,3 +149,57 @@ async def test_handle_get_partitions_falls_back_for_missing_name():
     # year=2025 was absent from the bulk result, so exactly one fallback call is made.
     assert client.per_name_calls == 1
     assert "rows=100" in out and "rows=200" in out
+
+
+async def test_handle_get_partitions_emits_derived_totals():
+    out = await handle_get_partitions(FakePartitionedClient(), "sales", "txns")
+    assert "Derived table-level totals" in out
+    # 100 + 200 rows summed across the two partitions.
+    assert "Rows      : 300" in out
+    # 2 + 3 files summed.
+    assert "Files     : 5" in out
+    assert "(from 2/2 partition(s))" in out
+
+
+class FakePartitionedStatsClient:
+    """Partitioned table with NO table-level numRows but populated partition stats."""
+
+    @contextlib.contextmanager
+    def request_cache(self):
+        yield
+
+    def get_table_stats(self, database, table):
+        # Table-level stats are absent — exactly the partitioned-table case.
+        return {
+            "num_rows": "-1",
+            "total_size": "-1",
+            "num_files": "-1",
+            "stats_available": False,
+            "last_modified": "",
+        }
+
+    def get_table(self, database, table):
+        return {"partition_keys": [{"name": "year", "type": "int", "comment": ""}]}
+
+    def get_partition_names(self, database, table, max_parts=2000):
+        return ["year=2024", "year=2025"]
+
+    def get_partition_basic_stats_bulk(self, database, table, names, key_names):
+        return {
+            "year=2024": {"num_rows": "100", "num_files": "2", "total_size": "2048"},
+            "year=2025": {"num_rows": "200", "num_files": "3", "total_size": "4096"},
+        }
+
+    def get_partition_basic_stats(self, database, table, name):
+        raise AssertionError("bulk result was complete; no per-name fallback expected")
+
+
+async def test_handle_get_table_stats_derives_table_level_from_partitions():
+    out = await handle_get_table_stats(FakePartitionedStatsClient(), "sales", "txns")
+    # Table-level line still reads unknown (Hive never rolls it up)...
+    assert "Table-level BASIC_STATS:" in out
+    # ...but the derived totals supply the effective figures.
+    assert "Derived table-level totals" in out
+    assert "Rows      : 300" in out
+    # The guidance now points at PARTITION-level ANALYZE, not a table-level ANALYZE.
+    assert "PARTITION (year) COMPUTE STATISTICS" in out

@@ -168,6 +168,7 @@ class HS2Client:
         hms_total_rows: int | None = None,
         table: str | None = None,
         partition_keys: list[str] | None = None,
+        partition_sample_rows: int | None = None,
     ) -> str:
         """
         Run EXPLAIN on two versions of a query and return a structured comparison.
@@ -177,6 +178,11 @@ class HS2Client:
           - Whether partition pruning is active in each plan
           - How much of the HMS total is scanned in each version
           - A plain-English verdict (which plan is better and why)
+
+        partition_sample_rows: HMS partition sample row count for the partition
+        matched by the optimized query's filter.  Supplied by the caller when
+        the optimized plan is expected to be a pure-fetch shape (which emits no
+        CBO row estimate), so the comparison table shows real numbers.
         """
         if not self.is_available():
             return _UNAVAILABLE_MSG
@@ -203,6 +209,7 @@ class HS2Client:
             hms_total_rows=hms_total_rows,
             table=table,
             partition_keys=partition_keys,
+            partition_sample_rows=partition_sample_rows,
         )
 
     def explain_with_row_estimates(

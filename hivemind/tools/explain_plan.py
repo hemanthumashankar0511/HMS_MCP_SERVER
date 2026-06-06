@@ -25,14 +25,27 @@ _CBO_TABLESCAN_RE = re.compile(
     r"TableScan\s+\[[^\]]+\]\s+\(rows=(\d+)\s+width=\d+\)\s+[\w.]+\@(\w+)",
 )
 _CBO_FILTER_RE = re.compile(
-    r"Filter Operator\s+\[[^\]]+\]\s+\(rows=(\d+)\s+width=\d+\)\s+predicate:(\([^)]*(?:\([^)]*\)[^)]*)*\))",
+    r"Filter Operator\s+\[[^\]]+\]\s+\(rows=(\d+)\s+width=\d+\)\s+predicate:(.+)",
 )
 _CBO_JOIN_BROADCAST_RE = re.compile(r"Map Join Operator.*BROADCAST", re.IGNORECASE)
 _CBO_JOIN_SHUFFLE_RE = re.compile(r"Map Join Operator.*(?:PARTITION_ONLY_SHUFFLE|SHUFFLE)", re.IGNORECASE)
 
-# Operator header lines in a Hive plan are either the literal "TableScan" or end
-# with "Operator" (e.g. "Filter Operator", "Group By Operator", "Map Join Operator").
+# Pure-fetch plan detection.
+# On CDP Hive 3, when a query's partition predicates are fully resolved at the
+# metastore file-listing stage, Hive generates a plan with only Stage-0 (a Fetch
+# Operator) and no Stage-1 (no Map/Reduce tasks). This is a reliable signal that
+# partition pruning occurred — the query never enters the Tez/MR execution layer.
+#
+# Contrast with the full-scan case where "Stage-1" always appears, even if the
+# plan also has a top-level Fetch Operator.
+_PLAN_CBO_OPTIMIZED_RE = re.compile(r"Plan optimized by CBO\.")
+_PLAN_FETCH_OP_RE = re.compile(r"\bFetch Operator\b")
+_PLAN_STAGE1_RE = re.compile(r"\bStage-1\b")
+
+# Operator header lines in a Hive plan are either the literal "TableScan", a
+# bracketed "TableScan [TS_N]", or end with "Operator".
 _OPERATOR_HEADERS = frozenset({"TableScan"})
+_BRACKETED_TS_RE = re.compile(r"^TableScan\s+\[")
 
 # How much raw plan text to keep in the report. Hive plans for wide joins can be
 # very large; we cap to keep the assembled prompt within a sane size.
@@ -45,7 +58,27 @@ def _clean_expr(expr: str) -> str:
 
 
 def _is_operator_header(line: str) -> bool:
-    return line in _OPERATOR_HEADERS or line.endswith("Operator")
+    return (
+        line in _OPERATOR_HEADERS
+        or line.endswith("Operator")
+        or bool(_BRACKETED_TS_RE.match(line))
+    )
+
+
+def _is_pure_fetch_plan(plan_text: str) -> bool:
+    """
+    Return True when the plan is a CBO fetch-only plan with no Map/Reduce stage.
+
+    On CDP Hive 3, partition predicates resolved entirely at the metastore
+    file-listing level cause Hive to skip Stage-1 (the Tez/MR Map stage) entirely
+    and generate a lightweight fetch plan.  A plan that contains Stage-1 is either
+    a full scan or a complex query that goes through map/reduce execution.
+    """
+    return (
+        _PLAN_CBO_OPTIMIZED_RE.search(plan_text) is not None
+        and _PLAN_FETCH_OP_RE.search(plan_text) is not None
+        and _PLAN_STAGE1_RE.search(plan_text) is None
+    )
 
 
 def _parse_tree_format(plan_text: str) -> tuple[list[dict], list[dict], list[str]]:
@@ -63,7 +96,7 @@ def _parse_tree_format(plan_text: str) -> tuple[list[dict], list[dict], list[str
         if _is_operator_header(line):
             current = {"operator": line, "table": None, "rows": None, "filter": None}
             operators.append(current)
-            if line == "TableScan":
+            if line == "TableScan" or _BRACKETED_TS_RE.match(line):
                 table_scans.append(current)
             continue
 
@@ -150,17 +183,17 @@ def _finalize_parsed(
                 detected = True
                 break
 
-    # Metastore-level partition pruning detection.
+    # Metastore-level partition pruning detection — two complementary heuristics.
     #
     # In Hive 3 on CDP, when a query has direct equality filters on partition keys,
     # Hive resolves them during metastore file-listing (before plan generation).
     # The partition predicates are stripped from the runtime FilterOperator — they
     # never appear in the plan text even though pruning *is* active.
     #
-    # Heuristic: if the caller provided partition keys, at least one non-partition
-    # runtime predicate exists in an operator, and none of those predicates mention
-    # any partition key, the partition predicates were consumed at the metastore
-    # level, which means pruning was applied.
+    # Heuristic 1: at least one non-partition runtime predicate exists and none of
+    # those predicates mention any partition key.  This fires for JOIN/GROUP BY
+    # queries where non-partition filters (e.g. NULL checks on join keys) remain
+    # in the plan but the partition predicate has already been consumed.
     if pkeys and not detected:
         all_op_predicates = [op["filter"] for op in operators if op.get("filter")]
         if all_op_predicates:
@@ -177,6 +210,19 @@ def _finalize_parsed(
                     "— applied at metastore level before plan generation)"
                 )
 
+    # Heuristic 2: pure-fetch plan.  When partition predicates reduce the scan to
+    # a single-partition fetch, Hive generates a plan with only Stage-0 (Fetch
+    # Operator) and no Stage-1 (no Map/Reduce tasks).  This plan has no runtime
+    # predicates at all (heuristic 1 can't fire), but the absence of Stage-1 is
+    # itself definitive evidence that the query never scanned beyond the pruned
+    # partitions.
+    if pkeys and not detected and _is_pure_fetch_plan(plan_text):
+        detected = True
+        filters.append(
+            "(inferred: CBO fetch-only plan — no Map/Reduce stage generated, "
+            "partition predicates resolved at metastore level before execution)"
+        )
+
     ts_rows = [t["rows"] for t in table_scans if isinstance(t["rows"], int) and t["rows"] >= 0]
     # Dominant scan = largest TableScan (fact table in joins), not smallest.
     cbo_est_rows = max(ts_rows) if ts_rows else None
@@ -188,6 +234,9 @@ def _finalize_parsed(
         "partition_filters": filters,
         "cbo_est_rows": cbo_est_rows,
         "join_strategy": _detect_join_strategy(plan_text),
+        # True when the plan is a CBO pure-fetch (no Stage-1).  Used by
+        # build_comparison_report to explain why CBO row estimates are absent.
+        "is_fetch_plan": _is_pure_fetch_plan(plan_text),
     }
 
 
@@ -366,18 +415,32 @@ def build_comparison_report(
     hms_total_rows: int | None = None,
     table: str | None = None,
     partition_keys: list[str] | None = None,
+    partition_sample_rows: int | None = None,
 ) -> str:
     """
     Produce a structured side-by-side comparison of two EXPLAIN plans.
 
     Uses the focus table (partitioned table when available) for row metrics rather
     than the first table in the query or the smallest scan in a join.
+
+    partition_sample_rows: when the optimized plan is a fetch-only plan (no CBO
+    row estimate emitted), callers may supply the HMS partition sample row count
+    for the filtered partition so the comparison table shows real numbers instead
+    of "unknown".
     """
     pkeys = partition_keys or []
     focus = table or ""
 
     rows_before = table_scan_rows_for(original_parsed, focus) if focus else original_parsed.get("cbo_est_rows")
     rows_after = table_scan_rows_for(optimized_parsed, focus) if focus else optimized_parsed.get("cbo_est_rows")
+
+    # For pure-fetch plans the CBO emits no row estimate. Fall back to the HMS
+    # partition sample row count when the caller supplies it — this is authoritative
+    # (computed by ANALYZE TABLE) and gives real numbers in the comparison table.
+    rows_after_source = "CBO"
+    if rows_after is None and optimized_parsed.get("is_fetch_plan") and partition_sample_rows is not None:
+        rows_after = partition_sample_rows
+        rows_after_source = "HMS"
 
     # Infer pruning on focus table: scan rows dropped materially after rewrite.
     pruning_before = original_parsed.get("partition_pruning_detected", False)
@@ -407,10 +470,11 @@ def build_comparison_report(
     def _rows_str(r: int | None) -> str:
         return f"{r:,}" if r is not None else "unknown"
 
+    rows_label = "TableScan rows" if rows_after_source == "CBO" else "Rows (After=HMS stats)"
     lines += [
         f"{'Metric':<22} {'Before':>16}   {'After':>16}   Change",
         "─" * 62,
-        f"{'TableScan rows':<22} {_rows_str(rows_before):>16}   {_rows_str(rows_after):>16}   {_row_delta_pct(rows_before, rows_after)}",
+        f"{rows_label:<22} {_rows_str(rows_before):>16}   {_rows_str(rows_after):>16}   {_row_delta_pct(rows_before, rows_after)}",
         f"{'Partition pruning':<22} {'Yes' if pruning_before else 'No':>16}   {'Yes' if pruning_after else 'No':>16}",
     ]
 
@@ -447,12 +511,19 @@ def build_comparison_report(
 
     lines += ["", "VERDICT", "───────"]
 
+    optimized_is_fetch = optimized_parsed.get("is_fetch_plan", False)
+
     if rows_before is not None and rows_after is not None:
         delta = _row_delta_pct(rows_before, rows_after)
         if rows_after < rows_before:
+            suffix = (
+                " (after rows from HMS partition stats — CBO not emitted for fetch-only plans)"
+                if rows_after_source == "HMS"
+                else ""
+            )
             lines.append(
-                f"The optimized plan scans {_rows_str(rows_after)} rows on the focus table "
-                f"vs {_rows_str(rows_before)} before ({delta})."
+                f"The optimized plan reads {_rows_str(rows_after)} rows on the focus table "
+                f"vs {_rows_str(rows_before)} before ({delta}).{suffix}"
             )
         elif rows_after == rows_before:
             lines.append("Both plans scan the same number of rows — the rewrite did not reduce I/O.")
@@ -460,6 +531,16 @@ def build_comparison_report(
             lines.append(
                 f"The optimized plan scans MORE rows ({delta}). Review the rewrite."
             )
+    elif rows_before is not None and optimized_is_fetch:
+        # rows_after is still None here — caller did not supply partition_sample_rows.
+        # Report qualitatively so the LLM isn't left with a bare "unknown".
+        lines.append(
+            f"Original plan estimated {_rows_str(rows_before)} rows scanned. "
+            "The optimized plan is a fetch-only scan (no Map/Reduce stage) — "
+            "Hive resolved the partition predicate at the metastore level, "
+            "eliminating the Tez execution stage entirely. "
+            "No CBO row estimate is emitted for fetch-only plans."
+        )
     else:
         lines.append(
             "Optimizer row estimates could not be parsed from the EXPLAIN plan. "
@@ -467,7 +548,13 @@ def build_comparison_report(
         )
 
     if not pruning_before and pruning_after:
-        lines.append("Partition pruning: activated in the optimized plan.")
+        if optimized_is_fetch:
+            lines.append(
+                "Partition pruning: activated in the optimized plan — fetch-only scan, "
+                "partition predicates fully resolved at the metastore level."
+            )
+        else:
+            lines.append("Partition pruning: activated in the optimized plan.")
     elif pruning_before and pruning_after:
         lines.append("Partition pruning: active in both plans.")
     elif not pruning_before and not pruning_after:

@@ -3,7 +3,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from hivemind.hms_client import _FORMAT_ALIASES
+from hivemind.hms_client import (
+    _FORMAT_ALIASES,
+    _PARTITION_ROLLUP_BATCH,
+    PARTITION_ROLLUP_CAP,
+    PARTITION_SAMPLE_CAP,
+)
 
 if TYPE_CHECKING:
     from hivemind.hms_client import HMSClient
@@ -70,7 +75,7 @@ def _format_table_type(table_type: str) -> str:
     }.get(table_type, table_type)
 
 
-def _bulk_partition_stats(
+def _collect_partition_stats(
     client: "HMSClient",
     database: str,
     table: str,
@@ -78,90 +83,170 @@ def _bulk_partition_stats(
     part_key_names: list[str],
 ) -> dict[str, dict[str, str]]:
     """
-    Fetch BASIC_STATS for the sampled partitions in a single round-trip when possible.
+    Fetch BASIC_STATS for many partitions, batched, preserving input order.
 
-    Falls back to a per-partition lookup only for names the bulk call did not return
-    (e.g. values HMS escapes in partition-name form), so the result is identical to
-    the previous per-partition behavior while collapsing the common case to one call.
+    Issues one get_partitions_by_names round-trip per _PARTITION_ROLLUP_BATCH chunk
+    and falls back to a per-partition lookup only for names the bulk call did not
+    return (e.g. values HMS escapes in partition-name form). Keeping the result
+    insertion-ordered lets the caller both sum every partition and slice a sample
+    from the front.
     """
-    try:
-        stats = client.get_partition_basic_stats_bulk(
-            database, table, part_names, part_key_names
-        )
-    except Exception:
-        stats = {}
-    for pn in part_names:
-        if pn not in stats:
-            try:
-                stats[pn] = client.get_partition_basic_stats(database, table, pn)
-            except Exception:
-                pass
-    return stats
+    out: dict[str, dict[str, str]] = {}
+    for i in range(0, len(part_names), _PARTITION_ROLLUP_BATCH):
+        chunk = part_names[i:i + _PARTITION_ROLLUP_BATCH]
+        try:
+            batch = client.get_partition_basic_stats_bulk(
+                database, table, chunk, part_key_names
+            )
+        except Exception:
+            batch = {}
+        for pn in chunk:
+            if pn in batch:
+                out[pn] = batch[pn]
+            else:
+                try:
+                    out[pn] = client.get_partition_basic_stats(database, table, pn)
+                except Exception:
+                    pass
+    return out
 
 
-def _append_partition_basic_stats(
-    lines: list[str],
+def _compute_partition_rollup(
     client: "HMSClient",
     database: str,
     table: str,
     part_key_names: list[str],
-    max_parts: int = 20,
-) -> None:
-    """Append sampled partition BASIC_STATS without treating them as table-level stats."""
-    lines.append("Partition-level BASIC_STATS sample (same cap as get_partitions):")
+) -> dict:
+    """
+    Derive table-level BASIC_STATS for a partitioned table by aggregating partitions.
+
+    Hive does not store a table-level numRows/totalSize/numFiles for partitioned
+    tables and no HMS API computes it, so we enumerate partitions (up to
+    PARTITION_ROLLUP_CAP) and sum each metric. This mirrors how Hive's own optimizer
+    derives the row count for a partitioned table.
+
+    Returns a dict with:
+      stats_map  - {partition_name: {num_rows, num_files, total_size}}, insertion-ordered
+      scanned    - number of partitions actually scanned
+      truncated  - True if the table likely has more partitions than the cap
+      sum_rows / sum_files / sum_size       - aggregated totals (ints)
+      rows_cov / files_cov / size_cov       - partitions that contributed each metric
+    On a listing failure an {"error": str} dict is returned instead.
+    """
     try:
-        part_names = client.get_partition_names(database, table, max_parts=max_parts)
+        part_names = client.get_partition_names(
+            database, table, max_parts=PARTITION_ROLLUP_CAP
+        )
     except Exception as exc:
-        lines.append(f"  (could not list partitions: {exc})")
+        return {"error": str(exc)}
+
+    truncated = len(part_names) >= PARTITION_ROLLUP_CAP
+    stats_map = _collect_partition_stats(
+        client, database, table, part_names, part_key_names
+    )
+
+    sum_rows = sum_files = sum_size = 0
+    rows_cov = files_cov = size_cov = 0
+    for pst in stats_map.values():
+        r = _stat_int(pst["num_rows"])
+        f = _stat_int(pst["num_files"])
+        s = _stat_int(pst["total_size"])
+        if r >= 0:
+            sum_rows += r
+            rows_cov += 1
+        if f >= 0:
+            sum_files += f
+            files_cov += 1
+        if s >= 0:
+            sum_size += s
+            size_cov += 1
+
+    return {
+        "stats_map": stats_map,
+        "scanned": len(part_names),
+        "truncated": truncated,
+        "sum_rows": sum_rows,
+        "sum_files": sum_files,
+        "sum_size": sum_size,
+        "rows_cov": rows_cov,
+        "files_cov": files_cov,
+        "size_cov": size_cov,
+    }
+
+
+def _append_derived_table_stats(lines: list[str], rollup: dict) -> bool:
+    """
+    Append table-level totals derived by aggregating partition BASIC_STATS.
+
+    Returns True if any derived total was emitted, False otherwise (e.g. no
+    partitions have stats, or the partition listing failed).
+    """
+    if "error" in rollup or not rollup.get("stats_map"):
+        return False
+    if not (rollup["rows_cov"] or rollup["size_cov"] or rollup["files_cov"]):
+        return False
+
+    scanned = rollup["scanned"]
+    note = ""
+    if rollup["truncated"]:
+        note = (
+            f" [partial: first {scanned} partitions scanned; table has more — "
+            "treat totals as a lower bound]"
+        )
+    lines.append(
+        "Derived table-level totals (aggregated from partition BASIC_STATS; Hive does "
+        f"not roll these into table-level stats for partitioned tables){note}:"
+    )
+
+    def _line(label: str, value: str, cov: int) -> str:
+        if cov:
+            return f"  {label}: {value}  (from {cov}/{scanned} partition(s))"
+        return f"  {label}: unknown"
+
+    lines.append(_line("Rows      ", f"{rollup['sum_rows']:,}", rollup["rows_cov"]))
+    lines.append(
+        _line("Total size", _format_bytes(str(rollup["sum_size"])), rollup["size_cov"])
+    )
+    lines.append(_line("Files     ", f"{rollup['sum_files']:,}", rollup["files_cov"]))
+    return True
+
+
+def _append_partition_basic_stats(
+    lines: list[str],
+    rollup: dict,
+    sample_cap: int = PARTITION_SAMPLE_CAP,
+) -> None:
+    """Append a per-partition BASIC_STATS sample (up to sample_cap rows) from a rollup."""
+    if "error" in rollup:
+        lines.append(f"Partition-level BASIC_STATS: could not list partitions: {rollup['error']}")
         return
 
-    if not part_names:
-        lines.append("  No partition data found (table may be empty or not yet populated).")
+    stats_map: dict[str, dict[str, str]] = rollup.get("stats_map", {})
+    if not stats_map:
+        lines.append(
+            "Partition-level BASIC_STATS: no partition data found "
+            "(table may be empty or not yet populated)."
+        )
         return
 
-    bulk_stats = _bulk_partition_stats(client, database, table, part_names, part_key_names)
-
-    sum_rows = 0
-    parts_with_rows = 0
-    detail: list[str] = []
-    for pn in part_names:
-        pst = bulk_stats.get(pn)
-        if pst is None:
-            detail.append(f"  {pn} (metadata error: stats unavailable)")
-            continue
-
-        nr = pst["num_rows"]
-        nf = pst["num_files"]
-        sz = pst["total_size"]
-        rows_i = _stat_int(nr)
-        if rows_i >= 0:
-            sum_rows += rows_i
-            parts_with_rows += 1
-
+    scanned = rollup["scanned"]
+    shown = min(len(stats_map), sample_cap)
+    more = "+" if rollup["truncated"] else ""
+    lines.append(
+        f"Partition-level BASIC_STATS sample (showing {shown} of {scanned}{more} partition(s)):"
+    )
+    for i, (pn, pst) in enumerate(stats_map.items()):
+        if i >= sample_cap:
+            lines.append(f"  ... {len(stats_map) - sample_cap} more partition(s) not shown")
+            break
+        nr, nf, sz = pst["num_rows"], pst["num_files"], pst["total_size"]
         if nr == "-1" and nf == "-1" and sz == "-1":
-            detail.append(f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)")
+            lines.append(f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)")
         else:
-            detail.append(
+            lines.append(
                 f"  {pn}  rows={_format_count(nr)}  "
                 f"files={_format_count(nf)}  size={_format_bytes(sz)}"
             )
-
-    lines.extend(detail)
-    suffix = ""
-    if len(part_names) >= max_parts:
-        suffix = " Partial sum — up to 20 partitions sampled; analyze all partitions separately if needed."
-    if parts_with_rows:
-        lines.append("")
-        lines.append(
-            f"  Sum(rows) over partitions with usable numRows ({parts_with_rows} partition(s)): "
-            f"{sum_rows:,}{suffix}"
-        )
-    else:
-        lines.append("")
-        lines.append(
-            "  No partition-level numRows in HMS sample. "
-            "Run ANALYZE TABLE ... PARTITION(...) COMPUTE STATISTICS."
-        )
 
 
 async def handle_list_databases(client: "HMSClient") -> str:
@@ -226,9 +311,9 @@ async def handle_search_tables(
     ]
     for r in results:
         lines.append(f"{r['database']:<20} {r['table']:<30} {r['match_reason']}")
-    if len(results) == 20:
+    if len(results) >= 30:
         lines.append("")
-        lines.append("Note: results capped at 20. Narrow your search if needed.")
+        lines.append("Note: results capped at 30. Narrow your search if needed.")
     return "\n".join(lines)
 
 
@@ -315,26 +400,45 @@ async def handle_get_table_stats(
 
         part_keys = info.get("partition_keys", [])
 
-        if not stats["stats_available"]:
-            lines.append("")
-            if part_keys:
-                lines.append(
-                    "Table-level numRows absent in HMS. "
-                    "Use the partition sample below for visibility, or run "
-                    f"ANALYZE TABLE {database}.{table} COMPUTE STATISTICS for table-level totals."
-                )
-            else:
+        # Non-partitioned table: table-level stats are the whole story.
+        if not part_keys:
+            if not stats["stats_available"]:
+                lines.append("")
                 lines.append(
                     "Table-level numRows absent in HMS. "
                     f"Run ANALYZE TABLE {database}.{table} COMPUTE STATISTICS."
                 )
+            return "\n".join(lines)
 
-        # Partitioned tables can carry table-level and partition-level stats
-        # independently, so always show the partition sample when keys exist.
-        if part_keys:
-            lines.append("")
-            part_key_names = [pk["name"] for pk in part_keys]
-            _append_partition_basic_stats(lines, client, database, table, part_key_names)
+        # Partitioned table: Hive writes BASIC_STATS per partition and never rolls
+        # them into a table-level numRows, so derive the totals by aggregating
+        # partitions (this is what Hive's optimizer does internally).
+        part_key_names = [pk["name"] for pk in part_keys]
+        rollup = _compute_partition_rollup(client, database, table, part_key_names)
+
+        lines.append("")
+        derived = _append_derived_table_stats(lines, rollup)
+
+        lines.append("")
+        pk_clause = ", ".join(part_key_names)
+        if not stats["stats_available"]:
+            if derived:
+                lines.append(
+                    "Note: Hive stores BASIC_STATS per partition and never rolls them "
+                    "into a table-level numRows, so the table-level line above stays "
+                    "'unknown' even after ANALYZE. The derived totals are the effective "
+                    "table-level figures. To (re)compute partition stats, run: "
+                    f"ANALYZE TABLE {database}.{table} PARTITION ({pk_clause}) COMPUTE STATISTICS."
+                )
+            else:
+                lines.append(
+                    "Table-level numRows absent and no partition BASIC_STATS found in HMS. "
+                    f"Run: ANALYZE TABLE {database}.{table} PARTITION ({pk_clause}) "
+                    "COMPUTE STATISTICS."
+                )
+
+        lines.append("")
+        _append_partition_basic_stats(lines, rollup)
 
         return "\n".join(lines)
 
@@ -359,40 +463,14 @@ async def handle_get_partitions(
     for pk in part_keys:
         lines.append(f"  {pk['name']:<25} {pk['type']}")
 
-    try:
-        # TODO: add output cap; tables with many partitions can return unbounded partition lists
-        part_names = client.get_partition_names(database, table, max_parts=20)
-    except Exception as exc:
-        lines.append(f"\nCould not fetch partition values: {exc}")
-        return "\n".join(lines)
+    part_key_names = [pk["name"] for pk in part_keys]
+    rollup = _compute_partition_rollup(client, database, table, part_key_names)
 
     lines.append("")
-    if part_names:
-        lines.append(
-            f"Showing {len(part_names)} sample partition(s); HMS BASIC_STATS per partition:"
-        )
-        part_key_names = [pk["name"] for pk in part_keys]
-        bulk_stats = _bulk_partition_stats(client, database, table, part_names, part_key_names)
-        for p in part_names:
-            lines.append(f"  {p}")
-            pst = bulk_stats.get(p)
-            if pst is None:
-                lines.append("    (could not load stats: stats unavailable)")
-                continue
-            nr, nf, ts = pst["num_rows"], pst["num_files"], pst["total_size"]
-            if nr == "-1" and nf == "-1" and ts == "-1":
-                lines.append(
-                    "    rows=unknown  files=unknown  size=unknown  "
-                    "(run ANALYZE TABLE ... PARTITION (...) COMPUTE STATISTICS)"
-                )
-            else:
-                lines.append(
-                    f"    rows={_format_count(nr)}  "
-                    f"files={_format_count(nf)}  "
-                    f"size={_format_bytes(ts)}"
-                )
-    else:
-        lines.append("No partition data found (table may be empty or not yet populated).")
+    if _append_derived_table_stats(lines, rollup):
+        lines.append("")
+
+    _append_partition_basic_stats(lines, rollup)
 
     return "\n".join(lines)
 
