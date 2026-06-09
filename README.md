@@ -146,6 +146,7 @@ cp -r /path/to/generated/gen-py/{hive_metastore,fb303} /path/to/HMS_MCP_Server/g
 ```
 
 The server adds `gen-py/` to `sys.path` automatically at startup.
+
 ### NOTE: This has already been done for you
 
 ---
@@ -195,7 +196,7 @@ HIVE_KERBEROS_PRINCIPAL=hive/ccycloud-1.example.site@YOUR-AD-REALM.COM  # ← fr
 Before starting the server, obtain a Kerberos ticket:
 
 ```bash
-kinit hive -kt /path/to/hive.keytab 
+kinit hive -kt /path/to/hive.keytab
 klist   # confirm ticket is valid
 pip install kerberos   # one-time: needed for HTTP SPNEGO auth
 ```
@@ -415,33 +416,35 @@ HiveMind runs over stdio. Point your MCP client at the entry point and pass the
 environment through. Example client config (e.g. `.cursor/mcp.json`):
 
 NOTE: This is the format for preset A cluster
+
 ```json
 {
-  "mcpServers": {
-    "hivemind": {
-      "command": "path_to_HMS_MCP_Server/.venv/bin/python",
-      "args": ["path_to_HMS_MCP_Server/hivemind/hivemind_server.py"],
-      "env": {
-        "PYTHONPATH": "path_to_HMS_MCP_Server:path_to_HMS_MCP_Server/gen-py"
-      }
-    }
-  }
+  "mcpServers": {
+    "hivemind": {
+      "command": "path_to_HMS_MCP_Server/.venv/bin/python",
+      "args": ["path_to_HMS_MCP_Server/hivemind/hivemind_server.py"],
+      "env": {
+        "PYTHONPATH": "path_to_HMS_MCP_Server:path_to_HMS_MCP_Server/gen-py"
+      }
+    }
+  }
 }
 ```
 
 NOTE: This is the format for preset B cluster
+
 ```json
 {
-  "mcpServers": {
-    "hivemind": {
-      "command": "path_to_HMS_MCP_Server/.venv/bin/python",
-      "args": ["path_to_HMS_MCP_Server/hivemind/hivemind_server.py"],
-      "env": {
-        "PYTHONPATH": "path_to_HMS_MCP_Server:path_to_HMS_MCP_Server/gen-py",
+  "mcpServers": {
+    "hivemind": {
+      "command": "path_to_HMS_MCP_Server/.venv/bin/python",
+      "args": ["path_to_HMS_MCP_Server/hivemind/hivemind_server.py"],
+      "env": {
+        "PYTHONPATH": "path_to_HMS_MCP_Server:path_to_HMS_MCP_Server/gen-py",
         "KRB5_CONFIG": "path_to_config_file/krb5_cluster.conf"
-      }
-    }
-  }
+      }
+    }
+  }
 }
 ```
 
@@ -451,9 +454,8 @@ NOTE: This is the format for preset B cluster
 In Cursor:
 
 1. Add the config above to `.cursor/mcp.json` with absolute paths for your machine.
-(Example: In cursor-> open settings -> go to tools&mcp -> add a custom mcp server)
+   (Example: Cursor → Settings → Tools & MCP → add a custom MCP server.)
 2. Confirm the HiveMind tools appear in the tool list.
-
 
 ---
 
@@ -508,7 +510,7 @@ pip install -e ".[dev]"
 
 # run the test suite
 python3 -m pytest tests/ -q
-
+```
 
 - Tests use fakes/stubs and need **no live cluster** or Thrift connection.
 - `pytest` is configured for `asyncio_mode = auto` (see `pyproject.toml`), so async handler tests run without extra decorators.
@@ -548,7 +550,4 @@ HMS_MCP_Server/
 ├── pyproject.toml             # package metadata + dependencies
 └── README.md
 ```
-
-
-
 
