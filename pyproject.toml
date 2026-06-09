@@ -32,7 +32,7 @@ dependencies = [
     "python-dotenv>=1.0,<2.0",
     # Optional HS2 EXPLAIN enrichment. PyHive speaks the HiveServer2 protocol so we
     # do not have to generate TCLIService Thrift stubs ourselves.
-    "pyhive[hive]>=0.7,<1.0",
+    "pyhive[hive_pure_sasl]>=0.7,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +40,14 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
+]
+# Secure enterprise endpoints: Auto-TLS is handled by stdlib ssl (no extra deps),
+# AD Kerberos (GSSAPI via SASL) needs a Thrift SASL transport, a SASL backend, and
+# an OS-level GSSAPI module. Install with:  pip install -e ".[kerberos]"
+kerberos = [
+    "thrift_sasl>=0.4",
+    "pure-sasl>=0.6",
+    "gssapi>=1.8",
 ]
 
 [project.scripts]

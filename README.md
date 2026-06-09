@@ -104,7 +104,7 @@ and continues in HMS-only mode — all discovery tools still work.
 
 ## Prerequisites
 
-- **Python 3.11+**
+- **Python 3.14**
 - Network access to a **Hive Metastore** on its Thrift port (default `9083`)
 - *(Optional)* Network access to **HiveServer2** (default `10000`) for `EXPLAIN` enrichment
 - Generated Thrift bindings under `gen-py/` (see [Installation](#installation))
@@ -116,7 +116,7 @@ and continues in HMS-only mode — all discovery tools still work.
 
 ```bash
 # 1. Clone, then create an isolated environment
-cd /path/to/HMS_MCP_Server
+git clone https://github.com/hemanthumashankar0511/HMS_MCP_SERVER.git
 python3 -m venv .venv && source .venv/bin/activate
 
 # 2. Install the package and its dependencies
@@ -133,70 +133,254 @@ not already present, generate them from a Hive source tree (the include path mus
 contain `fb303`):
 
 ```bash
-cd standalone-metastore/metastore-common/src/main/thrift
-thrift --gen py -I <path-to-fb303-if-needed> hive_metastore.thrift
+cd path_to_hive/standalone-metastore/src/main/thrift
+mkdir -p share/fb303/if/
+curl -sL https://raw.githubusercontent.com/apache/thrift/master/contrib/fb303/if/fb303.thrift -o share/fb303/if/fb303.thrift
+thrift -r -gen py -I . hive_metastore.thrift
 ```
 
 Copy the generated package into this repo:
 
 ```text
-HMS_MCP_Server/gen-py/hive_metastore/...
-HMS_MCP_Server/gen-py/fb303/...
+cp -r /path/to/generated/gen-py/{hive_metastore,fb303} /path/to/HMS_MCP_Server/gen-py/
 ```
 
 The server adds `gen-py/` to `sys.path` automatically at startup.
+### NOTE: This has already been done for you
 
 ---
 
 ## Configuration
 
-Create a `.env` file in the project root. **Use your own values — never commit this file**
-(it is already covered by `.gitignore`).
+A ready-to-use template lives in `.env.example` — copy it and fill in the marked lines:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`. Pick the preset that matches your cluster.
+
+---
+
+### Preset A — Plain / dev cluster (no TLS, no Kerberos)
+
+Minimum change: **1 line** (`HMS_HOST`). Optionally add `HS2_HOST` for EXPLAIN plans.
 
 ```env
-# ── Required: Hive Metastore (metadata only) ───────────────────────────
-HMS_HOST=<your-hms-host>          # hostname or IP of the metastore
-HMS_PORT=9083
-HMS_THRIFT_TIMEOUT_MS=10000       # socket timeout in milliseconds
+CLUSTER_PRESET=plain
 
-# ── Optional: HiveServer2 EXPLAIN enrichment ──────────────────────────
-# Leave HS2_HOST empty to run in HMS-only mode (no EXPLAIN plans).
-HS2_HOST=<your-hs2-host>
-HS2_PORT=10000
-HS2_USER=<username>               # the user you log in to the cluster as
-HS2_PASSWORD=                     # leave empty for NONE auth
-HS2_DATABASE=default              # default database for EXPLAIN sessions
-HS2_AUTH=NONE                     # NONE | LDAP | CUSTOM
-HS2_QUERY_TIMEOUT_S=60
+HMS_HOST=10.x.x.x          # ← your Hive Metastore IP or hostname
+
+HS2_HOST=10.x.x.x          # ← optional; leave blank for metadata-only mode
 ```
+
+---
+
+### Preset B — CDP cluster (Auto-TLS + AD Kerberos)
+
+Minimum change: **3 lines** (host × 2 + principal). TLS, Kerberos, port 10001, and HTTP transport are switched on automatically by the preset.
+
+```env
+CLUSTER_PRESET=cloudera_kerberos
+
+HMS_HOST=ccycloud-1.example.site          # ← your cluster node FQDN
+
+HS2_HOST=ccycloud-1.example.site          # ← same node (optional, leave blank to disable)
+
+# Copy from the 'principal=...' field in your Beeline/JDBC URL.
+# Setting this automatically enables Kerberos — no other auth flag needed.
+HIVE_KERBEROS_PRINCIPAL=hive/ccycloud-1.example.site@YOUR-AD-REALM.COM  # ← from JDBC URL
+```
+
+Before starting the server, obtain a Kerberos ticket:
+
+```bash
+kinit hive -kt /path/to/hive.keytab 
+klist   # confirm ticket is valid
+pip install kerberos   # one-time: needed for HTTP SPNEGO auth
+```
+
+---
+
+### Connecting to a new Kerberized cluster — one-time setup
+
+> Follow these steps once per cluster. The result is a dedicated `krb5` config and
+> keytab on your Mac that keeps credentials isolated per cluster. After completing
+> them, update `.env` following [Preset B](#preset-b--kerberized-cluster-auto-tls--kerberos).
+
+#### Step 1 — Collect details from the cluster
+
+SSH into the new cluster from your Mac:
+
+```bash
+# Run on Mac
+ssh root@<NEW-CLUSTER-HOSTNAME>
+```
+
+Now inside the cluster, run each of these and copy the output to a notes file on your Mac:
+
+```bash
+# Run INSIDE the cluster
+
+# 1. Get the exact FQDN of the HMS node
+hostname -f
+
+# 2. Get the full krb5.conf (you will need realm, KDC, and domain_realm sections)
+cat /etc/krb5.conf
+
+# 3. Confirm the keytab path and that it has a hive principal
+ls -la /path/to/hive.keytab
+klist -kt /path/to/hive.keytab
+
+# 4. Get the Kerberos principal from the running HiveServer2 config
+grep -i "kerberos.principal" /etc/hive/conf/hive-site.xml | head -5
+
+# 5. Confirm HMS is listening on 9083
+netstat -tlnp 2>/dev/null | grep 9083 || ss -tlnp | grep 9083
+
+# 6. Done on cluster
+exit
+```
+
+From the `klist -kt` output you will see something like:
+
+```
+hive/node-2.newcluster.example.com@NEW-REALM.EXAMPLE.COM
+```
+
+That full string is your `HIVE_KERBEROS_PRINCIPAL`. Note it exactly.
+
+#### Step 2 — Copy files from cluster to Mac
+
+Back on your Mac, copy both the config and keytab:
+
+```bash
+# Run on Mac
+
+# Copy the krb5.conf from the new cluster into its own named file
+scp root@<NEW-CLUSTER-HOSTNAME>:/etc/krb5.conf ~/krb5_newcluster.conf
+
+# Copy the hive keytab from the new cluster into its own named file
+scp root@<NEW-CLUSTER-HOSTNAME>:/path/to/hive.keytab ~/hive-newcluster.keytab
+
+# Lock down the keytab permissions
+chmod 600 ~/hive-newcluster.keytab
+
+# Verify both files landed
+ls -la ~/krb5_newcluster.conf ~/hive-newcluster.keytab
+cat ~/krb5_newcluster.conf | grep -A3 "\[realms\]"
+```
+
+#### Step 3 — Install Kerberos tools on Mac (if not already done)
+
+```bash
+# Run on Mac (one time, skip if already done)
+brew install krb5
+
+# Add the Homebrew krb5 binaries to your PATH permanently
+echo 'export PATH="/opt/homebrew/opt/krb5/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+
+# Confirm kinit is from Homebrew, not macOS built-in
+which kinit
+# Should show: /opt/homebrew/opt/krb5/bin/kinit
+```
+
+Also install the Python Kerberos package in your venv if not done yet:
+
+```bash
+# Run on Mac
+cd /path/to/HMS_MCP_Server
+source .venv/bin/activate
+pip install kerberos
+```
+
+#### Step 4 — Test `kinit` with the new cluster config
+
+```bash
+# Run on Mac
+
+# Get a ticket using the new cluster's config and keytab
+KRB5_CONFIG=~/krb5_newcluster.conf kinit -kt ~/hive-newcluster.keytab hive
+
+# Verify the ticket (must show a valid expiry, no errors)
+KRB5_CONFIG=~/krb5_newcluster.conf klist
+```
+
+Expected output:
+
+```
+Credentials cache: API:...
+        Principal: hive@NEW-REALM.EXAMPLE.COM
+  Issued                Expires               Principal
+Jun  8 14:00:00 2026   Jun  9 14:00:00 2026  krbtgt/NEW-REALM.EXAMPLE.COM@NEW-REALM.EXAMPLE.COM
+```
+
+> Do not proceed if `kinit` fails or `klist` shows warnings.
+
+#### Step 5 — `kinit` before each session (every time you switch to this cluster)
+
+```bash
+# Run on Mac
+KRB5_CONFIG=~/krb5_newcluster.conf kinit -kt ~/hive-newcluster.keytab hive
+KRB5_CONFIG=~/krb5_newcluster.conf klist
+```
+
+#### Step 6 — Update `.env`
+
+Comment out the currently active preset block and replace it. Your `.env` should look
+exactly like this (following the same Preset B layout):
+
+```env
+CLUSTER_PRESET=kerberized
+
+HMS_HOST=node-1.newcluster.example.com          # ← FQDN from hostname -f
+
+HS2_HOST=node-1.newcluster.example.com          # ← same node (optional, leave blank to disable)
+
+HIVE_KERBEROS_PRINCIPAL=hive/node-1.newcluster.example.com@NEW-REALM.EXAMPLE.COM  # ← from klist -kt output
+```
+
+---
+
+### All available variables
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
+| `CLUSTER_PRESET` | | `plain` | `plain` or `cloudera_kerberos` — sets all secure defaults for Cloudera clusters. |
 | `HMS_HOST` | ✅ | — | Hive Metastore host. Server exits if unset. |
 | `HMS_PORT` | | `9083` | Metastore Thrift port. |
 | `HMS_THRIFT_TIMEOUT_MS` | | `10000` | Thrift socket timeout (ms). |
 | `HS2_HOST` | | *(empty)* | HiveServer2 host. Empty ⇒ HMS-only mode. |
-| `HS2_PORT` | | `10000` | HiveServer2 port. |
+| `HS2_PORT` | | `10000` / `10001`* | HiveServer2 port. (*`10001` when preset is `cloudera_kerberos`.) |
 | `HS2_USER` | | *(empty)* | HS2 login user. |
-| `HS2_PASSWORD` | | *(empty)* | HS2 password (only for LDAP/CUSTOM auth). |
+| `HS2_PASSWORD` | | *(empty)* | HS2 password (LDAP/CUSTOM only). |
 | `HS2_DATABASE` | | `default` | Default database for EXPLAIN sessions. |
-| `HS2_AUTH` | | `NONE` | Auth mode: `NONE`, `LDAP`, or `CUSTOM`. |
+| `HS2_AUTH` | | `NONE` | `NONE`, `LDAP`, or `CUSTOM` (overridden automatically when Kerberos is on). |
+| `HS2_TRANSPORT_MODE` | | `binary` / `http`* | `binary` = Thrift (port 10000); `http` = Cloudera HTTP (port 10001). (*`http` when preset is `cloudera_kerberos`.) |
 | `HS2_QUERY_TIMEOUT_S` | | `60` | EXPLAIN statement timeout (s). |
+| `HIVE_USE_TLS` | | `false` / `true`* | Wrap sockets in TLS. (*`true` when preset is `cloudera_kerberos`.) |
+| `HIVE_USE_KERBEROS` | | auto | Auto-enabled when `HIVE_KERBEROS_PRINCIPAL` is set, or when preset is `cloudera_kerberos`. |
+| `HIVE_KERBEROS_PRINCIPAL` | | *(empty)* | Service principal, e.g. `hive/host@REALM`. **Setting this enables Kerberos automatically.** |
+| `HIVE_HS2_SERVICE_NAME` | | `hive` | SASL service name (fallback when principal is not set). |
+| `KRB5_CCACHE` | | *(empty)* | Kerberos credential-cache path override (exported as `KRB5CCNAME`). |
 
 > **Do not hard-code hosts, IPs, or credentials anywhere in source or docs.** Keep them
-> in `.env` only.
+> in `.env` only (already covered by `.gitignore`).
+>
+> **TLS note.** For Cloudera Auto-TLS clusters, certificate chain validation is relaxed
+> (the wire is still encrypted) so the internal self-signed CA works out of the box — no
+> truststore configuration is needed on the client side.
 
 ---
 
 ## Running the server
 
 ```bash
-cd /path/to/HMS_MCP_Server
+cd /path_to_HMS_MCP_Server
 source .venv/bin/activate
 
 # Either entry point works:
-hivemind-mcp
-# or
 PYTHONPATH=.:gen-py python hivemind/hivemind_server.py
 ```
 
@@ -230,33 +414,34 @@ HS2 connection failed (...). Continuing in HMS-only mode.
 HiveMind runs over stdio. Point your MCP client at the entry point and pass the
 environment through. Example client config (e.g. `.cursor/mcp.json`):
 
+NOTE: This is the format for preset A cluster
 ```json
 {
-  "mcpServers": {
-    "hivemind": {
-      "command": "/path/to/HMS_MCP_Server/.venv/bin/hivemind-mcp",
-      "env": {
-        "HMS_HOST": "<your-hms-host>"
-      }
-    }
-  }
+  "mcpServers": {
+    "hivemind": {
+      "command": "path_to_HMS_MCP_Server/.venv/bin/python",
+      "args": ["path_to_HMS_MCP_Server/hivemind/hivemind_server.py"],
+      "env": {
+        "PYTHONPATH": "path_to_HMS_MCP_Server:path_to_HMS_MCP_Server/gen-py"
+      }
+    }
+  }
 }
 ```
 
-Or invoke the module directly:
-
+NOTE: This is the format for preset B cluster
 ```json
 {
-  "mcpServers": {
-    "hivemind": {
-      "command": "/path/to/HMS_MCP_Server/.venv/bin/python",
-      "args": ["hivemind/hivemind_server.py"],
-      "env": {
-        "PYTHONPATH": "/path/to/HMS_MCP_Server:/path/to/HMS_MCP_Server/gen-py",
-        "HMS_HOST": "<your-hms-host>"
-      }
-    }
-  }
+  "mcpServers": {
+    "hivemind": {
+      "command": "path_to_HMS_MCP_Server/.venv/bin/python",
+      "args": ["path_to_HMS_MCP_Server/hivemind/hivemind_server.py"],
+      "env": {
+        "PYTHONPATH": "path_to_HMS_MCP_Server:path_to_HMS_MCP_Server/gen-py",
+        "KRB5_CONFIG": "path_to_config_file/krb5_cluster.conf"
+      }
+    }
+  }
 }
 ```
 
@@ -266,8 +451,9 @@ Or invoke the module directly:
 In Cursor:
 
 1. Add the config above to `.cursor/mcp.json` with absolute paths for your machine.
-2. Command Palette → **"Cursor: Restart MCP Servers"**.
-3. Open Agent mode and confirm the HiveMind tools appear in the tool list.
+(Example: In cursor-> open settings -> go to tools&mcp -> add a custom mcp server)
+2. Confirm the HiveMind tools appear in the tool list.
+
 
 ---
 
@@ -323,9 +509,6 @@ pip install -e ".[dev]"
 # run the test suite
 python3 -m pytest tests/ -q
 
-# lint
-ruff check .
-```
 
 - Tests use fakes/stubs and need **no live cluster** or Thrift connection.
 - `pytest` is configured for `asyncio_mode = auto` (see `pyproject.toml`), so async handler tests run without extra decorators.
@@ -366,8 +549,6 @@ HMS_MCP_Server/
 └── README.md
 ```
 
----
 
-## License
 
-MIT — see `pyproject.toml`.
+

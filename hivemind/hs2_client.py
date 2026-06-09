@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any
 
+from hivemind.hms_client import _service_from_principal
 from hivemind.tools.explain_plan import (
     build_comparison_report,
     build_hs2_report,
@@ -13,6 +14,10 @@ from hivemind.tools.explain_plan import (
 )
 
 logger = logging.getLogger(__name__)
+
+_KERBEROS_HINT = (
+    "Ensure you have run 'kinit' with a valid keytab/principal before starting the server."
+)
 
 _TRAILING_SEMICOLONS_RE = re.compile(r"[\s;]+$")
 
@@ -38,6 +43,14 @@ class HS2Client:
 
     Access is guarded by a lock so the shared PyHive connection cannot be corrupted
     by concurrent tool invocations, mirroring HMSClient's threading model.
+
+    Two transport modes are supported via HS2_TRANSPORT_MODE:
+      - 'binary' (default): plain Thrift binary framing on port 10000. Kerberos is
+        handled via thrift_sasl + GSSAPI (pure-sasl / python-sasl backend).
+      - 'http': HiveServer2 HTTP endpoint (Cloudera CDH/CDP default), typically
+        port 10001 with ssl=true. Kerberos is handled via SPNEGO (the OS-level
+        'kerberos' Python package wraps the GSS-Negotiate HTTP header). This is the
+        mode used by Cloudera clusters whose JDBC URL shows transportMode=http.
     """
 
     def __init__(
@@ -49,14 +62,32 @@ class HS2Client:
         database: str = "default",
         auth: str = "NONE",
         timeout_s: int = 60,
+        *,
+        use_tls: bool = False,
+        use_kerberos: bool = False,
+        kerberos_principal: str = "",
+        kerberos_service_name: str = "hive",
+        use_http_transport: bool = False,
     ) -> None:
         self._host = host
         self._port = port
         self._user = user or None
         self._password = password
         self._database = database or "default"
-        self._auth = (auth or "NONE").upper()
         self._timeout_s = timeout_s
+        # Enterprise security layers. When Kerberos is on it overrides the auth
+        # mode to PyHive's 'KERBEROS' regardless of the legacy HS2_AUTH value.
+        self._use_tls = use_tls
+        self._use_kerberos = use_kerberos
+        self._kerberos_principal = (kerberos_principal or "").strip()
+        self._kerberos_service = _service_from_principal(
+            self._kerberos_principal, kerberos_service_name or "hive"
+        )
+        self._auth = "KERBEROS" if use_kerberos else (auth or "NONE").upper()
+        # HTTP transport: Cloudera CDH/CDP clusters expose HS2 as an HTTPS/HTTP
+        # endpoint (transportMode=http, port 10001). Set this when the JDBC URL
+        # shows transportMode=http; leave False for plain Thrift binary (port 10000).
+        self._use_http_transport = use_http_transport
         self._conn: Any = None
         self._lock = threading.Lock()
         self._connect()
@@ -77,22 +108,61 @@ class HS2Client:
                 pass
             self._conn = None
 
-        # For NONE auth PyHive requires password to be None; LDAP/CUSTOM use it.
-        password = None if self._auth == "NONE" else (self._password or None)
-        self._conn = hive.Connection(
-            host=self._host,
-            port=self._port,
-            username=self._user,
-            password=password,
-            database=self._database,
-            auth=self._auth,
-        )
+        conn_kwargs: dict[str, Any] = {
+            "host": self._host,
+            "port": self._port,
+            "username": self._user,
+            "database": self._database,
+            "auth": self._auth,
+        }
+
+        if self._use_http_transport:
+            # HTTP transport mode (Cloudera CDH/CDP: transportMode=http, port 10001).
+            #
+            # PyHive's HTTP code path is triggered by the 'scheme' argument. It
+            # builds a THttpClient to /cliservice/ and for KERBEROS auth it attaches
+            # an SPNEGO 'Authorization: Negotiate' header using the 'kerberos' Python
+            # package (NOT thrift_sasl/GSSAPI — that is the binary transport path).
+            #
+            # TLS validation is relaxed to accept Cloudera's internal Auto-TLS CA:
+            # ssl_cert='none' → CERT_NONE, check_hostname=False (PyHive defaults).
+            conn_kwargs["scheme"] = "https" if self._use_tls else "http"
+            if self._auth == "KERBEROS":
+                conn_kwargs["kerberos_service_name"] = self._kerberos_service
+            elif self._auth not in ("NONE", "NOSASL"):
+                conn_kwargs["password"] = self._password or None
+            # 'configuration' dict is not used in HTTP mode; TLS is via the scheme.
+        else:
+            # Binary Thrift transport (standard port 10000).
+            if self._auth == "KERBEROS":
+                # PyHive builds the thrift_sasl GSSAPI transport from the service name;
+                # password must be unset in KERBEROS mode.
+                conn_kwargs["kerberos_service_name"] = self._kerberos_service
+            elif self._auth == "NONE":
+                conn_kwargs["password"] = None
+            else:
+                conn_kwargs["password"] = self._password or None
+
+            # Auto-TLS: signal HS2 session to use SSL via session configuration.
+            if self._use_tls:
+                conn_kwargs["configuration"] = {"ssl": "true"}
+
+        try:
+            self._conn = hive.Connection(**conn_kwargs)
+        except Exception as exc:  # noqa: BLE001 - surface a clean Kerberos diagnostic
+            # GSSAPI/SASL or SPNEGO handshakes fail loudly when no valid TGT exists.
+            if self._use_kerberos:
+                logger.error("HS2 Kerberos handshake failed: %s. %s", exc, _KERBEROS_HINT)
+            raise
+
         logger.info(
-            "Connected to HS2 at %s:%d (database=%s, auth=%s)",
+            "Connected to HS2 at %s:%d (database=%s, auth=%s, tls=%s, http=%s)",
             self._host,
             self._port,
             self._database,
             self._auth,
+            self._use_tls,
+            self._use_http_transport,
         )
 
     def is_available(self) -> bool:
