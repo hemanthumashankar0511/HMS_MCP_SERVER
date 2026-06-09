@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+import socket
+import ssl
 import sys
 import threading
 from collections.abc import Iterator
@@ -10,11 +12,139 @@ from pathlib import Path
 from typing import Any
 
 from thrift.protocol import TBinaryProtocol
-from thrift.transport import TSocket, TTransport
+from thrift.transport import TSocket, TSSLSocket, TTransport
 from thrift.transport.TTransport import TTransportException
 from thrift.Thrift import TApplicationException
 
 logger = logging.getLogger(__name__)
+
+
+def _service_from_principal(principal: str, default: str = "hive") -> str:
+    """
+    Extract the SASL/GSSAPI service (primary) component from a Kerberos principal.
+
+    A service principal looks like ``hive/host.fqdn@REALM`` (or ``hive@REALM``);
+    the primary is everything before the first ``/`` (or ``@``). When no principal
+    is supplied we fall back to the explicitly configured service name (usually
+    ``hive``), which is what the HS2/HMS SASL transport mechanism expects.
+    """
+    principal = (principal or "").strip()
+    if "/" in principal:
+        return principal.split("/", 1)[0]
+    if "@" in principal:
+        return principal.split("@", 1)[0]
+    return default or "hive"
+
+
+def _canonical_fqdn(host: str) -> str:
+    """
+    Resolve host to its canonical fully-qualified domain name for Kerberos.
+
+    GSSAPI builds the service ticket from ``service@FQDN``; an IP address or a
+    short hostname makes the KDC reject the request, so we canonicalize via DNS.
+    Falls back to the original value if resolution yields nothing useful.
+    """
+    try:
+        fqdn = socket.getfqdn(host)
+    except Exception:  # noqa: BLE001 - resolution is best-effort
+        return host
+    return fqdn or host
+
+
+def _insecure_ssl_context() -> ssl.SSLContext:
+    """
+    Build a permissive TLS context for internal Auto-TLS endpoints.
+
+    Auto-TLS clusters present internal/self-signed certificates that chain to a
+    private CA, so chain and hostname verification are disabled here. This is the
+    intent of Thrift's deprecated ``validate=False`` flag, but it is applied via an
+    explicit context because modern Thrift evaluates ``validate=`` against a
+    ``PROTOCOL_TLS_CLIENT`` default (verify_mode=CERT_REQUIRED) and rejects the
+    socket before the relaxed setting is applied. The wire is still TLS-encrypted;
+    only peer-certificate validation is relaxed (suitable for internal/test use).
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _make_pure_sasl_client(host: str, service: str) -> Any:
+    """
+    Build a corrected pure-Python SASL/GSSAPI client for thrift_sasl.
+
+    The pure-Python fallback (``pure-sasl`` via PyHive's ``PureSASLClient`` shim)
+    is used when the C ``sasl`` extension is not installed. That shim has a known
+    bug: its ``encode``/``decode`` methods are inverted and omit the frame length
+    header. thrift_sasl's contract is:
+
+        encode(outgoing)        -> GSS-wrap the bytes, prefix a 4-byte BE length
+        decode(header + body)   -> strip the 4-byte length, GSS-unwrap the body
+
+    With QOP=auth this is a no-op (wrap/unwrap return the input unchanged), so the
+    shim's bug is invisible. But on a cluster that negotiates auth-int/auth-conf
+    (``hadoop.rpc.protection`` = integrity/privacy) the broken shim calls GSS
+    *unwrap* on outgoing plaintext, producing GSS_S_DEFECTIVE_TOKEN
+    ("A token was invalid") on the first RPC after a successful handshake.
+
+    This subclass restores the correct contract so GSSAPI works regardless of the
+    negotiated QOP.
+    """
+    import struct  # noqa: PLC0415
+
+    from pyhive.sasl_compat import PureSASLClient  # noqa: PLC0415
+
+    class _CorrectedPureSASLClient(PureSASLClient):  # type: ignore[misc, valid-type]
+        def encode(self, outgoing: Any) -> tuple[bool, Any]:
+            try:
+                self.error = None
+                wrapped = self.wrap(outgoing)
+                # QOP=auth: wrap() returns the input unchanged and thrift_sasl
+                # sends it without a length header (it detects the no-op by the
+                # length being unchanged), so pass it straight through.
+                if wrapped is outgoing or len(wrapped) == len(outgoing):
+                    return True, wrapped
+                return True, struct.pack(">I", len(wrapped)) + wrapped
+            except Exception as exc:  # noqa: BLE001 - surfaced via getError()
+                self.error = str(exc)
+                return False, None
+
+        def decode(self, incoming: Any) -> tuple[bool, Any]:
+            try:
+                self.error = None
+                # thrift_sasl hands us the 4-byte length header + body for
+                # encoded frames; strip it before unwrapping. For QOP=auth the
+                # unwrap is a no-op and no header is present.
+                body = incoming[4:] if len(incoming) > 4 else incoming
+                return True, self.unwrap(body)
+            except Exception as exc:  # noqa: BLE001 - surfaced via getError()
+                self.error = str(exc)
+                return False, None
+
+    return _CorrectedPureSASLClient(host=host, service=service)
+
+
+def _make_gssapi_sasl_client(host: str, service: str) -> Any:
+    """
+    Build a SASL client for GSSAPI that satisfies thrift_sasl's factory protocol.
+
+    thrift_sasl expects an object exposing start/step/encode/decode/getError.
+    The C-extension ``sasl`` (python-sasl) provides this natively; when only the
+    pure-Python ``pure-sasl`` backend is installed we use a corrected wrapper
+    around PyHive's PureSASLClient shim (see _make_pure_sasl_client for why the
+    stock shim is broken for QOP=auth-int/auth-conf). GSSAPI itself is provided by
+    the OS-level ``gssapi``/``kerberos`` module that the SASL backend loads.
+    """
+    try:
+        import sasl  # noqa: PLC0415 - optional C SASL backend
+
+        client = sasl.Client()
+        client.setAttr("host", host)
+        client.setAttr("service", service)
+        client.init()
+        return client
+    except ImportError:
+        return _make_pure_sasl_client(host, service)
 
 _GEN = Path(__file__).resolve().parent.parent / "gen-py"
 if _GEN.is_dir() and str(_GEN) not in sys.path:
@@ -103,11 +233,31 @@ def _field_to_dict(f: Any) -> dict[str, str]:
 class HMSClient:
     """Thin Thrift wrapper for HMS discovery queries. Read-only, auto-reconnects once on failure."""
 
-    def __init__(self, host: str, port: int = 9083, timeout_ms: int = 10_000) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int = 9083,
+        timeout_ms: int = 10_000,
+        *,
+        use_tls: bool = False,
+        use_kerberos: bool = False,
+        kerberos_principal: str = "",
+        kerberos_service_name: str = "hive",
+    ) -> None:
         self._host = host
         self._port = port
         self._timeout_ms = timeout_ms
-        self._transport: TTransport.TBufferedTransport | None = None
+        # Enterprise security layers. Both are independent: TLS secures the
+        # transport, Kerberos authenticates the session. Either, both, or neither
+        # may be enabled; when both are off the client uses a plain text socket.
+        self._use_tls = use_tls
+        self._use_kerberos = use_kerberos
+        self._kerberos_principal = (kerberos_principal or "").strip()
+        # Principal primary (e.g. "hive") wins; otherwise the configured service name.
+        self._kerberos_service = _service_from_principal(
+            self._kerberos_principal, kerberos_service_name or "hive"
+        )
+        self._transport: TTransport.TTransportBase | None = None
         self._client: Any = None
         # Guards transport access so the shared Thrift client cannot be corrupted
         # by concurrent use. Non-reentrant is safe: _connect never calls _call.
@@ -152,13 +302,65 @@ class HMSClient:
             except TTransportException:
                 pass
 
-        sock = TSocket.TSocket(self._host, self._port)
+        # Layer 1 — raw socket. TSSLSocket for Auto-TLS clusters, plain TSocket
+        # otherwise. The permissive context tolerates internal self-signed certs
+        # (the validate=False intent) while keeping the wire encrypted.
+        if self._use_tls:
+            sock = TSSLSocket.TSSLSocket(
+                self._host, self._port, ssl_context=_insecure_ssl_context()
+            )
+        else:
+            sock = TSocket.TSocket(self._host, self._port)
         sock.setTimeout(self._timeout_ms)
-        self._transport = TTransport.TBufferedTransport(sock)
+
+        # Layer 2 — SASL/GSSAPI wrapper for AD Kerberos, else a plain buffered
+        # transport. The SASL transport is itself framed/buffered, so it is the
+        # top transport when Kerberos is on (no extra TBufferedTransport needed).
+        if self._use_kerberos:
+            self._transport = self._kerberos_transport(sock)
+        else:
+            self._transport = TTransport.TBufferedTransport(sock)
+
+        # Layer 3 — binary protocol over whichever transport stack we built.
         protocol = TBinaryProtocol.TBinaryProtocol(self._transport)
         self._client = ThriftHiveMetastore.Client(protocol)
         self._transport.open()
-        logger.info("Connected to HMS at %s:%d", self._host, self._port)
+        logger.info(
+            "Connected to HMS at %s:%d (tls=%s, kerberos=%s)",
+            self._host,
+            self._port,
+            self._use_tls,
+            self._use_kerberos,
+        )
+
+    def _kerberos_transport(self, sock: Any) -> Any:
+        """
+        Wrap a socket in a thrift_sasl GSSAPI transport for AD Kerberos.
+
+        The SASL service is the principal primary (usually ``hive``) and the SASL
+        host MUST be the canonical FQDN — Kerberos ticket generation fails on an
+        IP or short name. A valid TGT (via ``kinit`` or a keytab) must already be
+        present in the credential cache; the handshake happens on transport open.
+        """
+        try:
+            import thrift_sasl  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(
+                "Kerberos transport requires 'thrift_sasl' plus a SASL backend "
+                "('pure-sasl' or 'sasl') and an OS GSSAPI module ('gssapi'/'kerberos'). "
+                "Install the kerberos extras (see README)."
+            ) from exc
+
+        fqdn = _canonical_fqdn(self._host)
+        service = self._kerberos_service
+
+        def sasl_factory() -> Any:
+            return _make_gssapi_sasl_client(host=fqdn, service=service)
+
+        logger.info(
+            "Wrapping HMS transport in SASL/GSSAPI (service=%s, host=%s)", service, fqdn
+        )
+        return thrift_sasl.TSaslClientTransport(sasl_factory, "GSSAPI", sock)
 
     def _call(self, fn_name: str, *args: Any) -> Any:
         """Calls a Thrift method, retrying once on transport failure."""

@@ -34,18 +34,89 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hivemind.server")
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# ── Cluster preset ─────────────────────────────────────────────────────────────
+# CLUSTER_PRESET=cloudera_kerberos turns on all Cloudera CDH/CDP secure defaults
+# (Auto-TLS, Kerberos/GSSAPI, HTTP transport on port 10001) so the only values
+# a user needs to supply individually are HMS_HOST, HS2_HOST, and
+# HIVE_KERBEROS_PRINCIPAL. Every preset default can be overridden by an explicit
+# env var — the preset only changes what the _absent_ variable resolves to.
+#
+#   plain (default) — no TLS, no Kerberos, Thrift binary, HS2 port 10000
+#   cloudera_kerberos — Auto-TLS, AD Kerberos, HTTP transport, HS2 port 10001
+_CLUSTER_PRESET = (os.environ.get("CLUSTER_PRESET") or "plain").strip().lower()
+_IS_CLOUDERA = _CLUSTER_PRESET in ("cloudera_kerberos", "cloudera")
+
+# ── HMS ────────────────────────────────────────────────────────────────────────
 _HMS_HOST = (os.environ.get("HMS_HOST") or "").strip()
 _HMS_PORT = int((os.environ.get("HMS_PORT") or "9083").strip())
 _TIMEOUT_MS = int(os.environ.get("HMS_THRIFT_TIMEOUT_MS", "10000"))
 
-# HS2 is optional. When HS2_HOST is unset the server runs in HMS-only mode.
+# ── Security ──────────────────────────────────────────────────────────────────
+# TLS is split into two independent flags because on Cloudera CDH/CDP:
+#   • HMS (port 9083) uses plain Thrift + SASL/Kerberos — NO TLS on the wire.
+#     TLS on the metastore Thrift port causes an immediate SSL EOF.
+#   • HS2 (port 10001) uses HTTPS — TLS IS required.
+#
+# HMS_USE_TLS  — controls the HMSClient Thrift socket. Defaults to false even
+#                for the cloudera_kerberos preset.
+# HS2_USE_TLS  — controls the HS2Client HTTPS connection. Defaults to true for
+#                the cloudera_kerberos preset.
+# HIVE_USE_TLS — legacy single flag; when set it overrides BOTH of the above so
+#                existing configs that explicitly set it keep working.
+_HIVE_USE_TLS_OVERRIDE = os.environ.get("HIVE_USE_TLS")
+if _HIVE_USE_TLS_OVERRIDE is not None:
+    _HMS_USE_TLS = _env_bool("HIVE_USE_TLS")
+    _HS2_USE_TLS = _env_bool("HIVE_USE_TLS")
+else:
+    _HMS_USE_TLS = _env_bool("HMS_USE_TLS", default=False)
+    _HS2_USE_TLS = _env_bool("HS2_USE_TLS", default=_IS_CLOUDERA)
+
+# Kerberos principal. Setting this automatically enables Kerberos authentication
+# so HIVE_USE_KERBEROS=true is not required as a separate line.
+_HIVE_KERBEROS_PRINCIPAL = (os.environ.get("HIVE_KERBEROS_PRINCIPAL") or "").strip()
+
+# Auto-enable Kerberos when:
+#   • HIVE_USE_KERBEROS=true is explicitly set, OR
+#   • HIVE_KERBEROS_PRINCIPAL is non-empty (no need to set both), OR
+#   • preset is cloudera_kerberos
+_HIVE_USE_KERBEROS = _env_bool(
+    "HIVE_USE_KERBEROS",
+    default=bool(_HIVE_KERBEROS_PRINCIPAL) or _IS_CLOUDERA,
+)
+
+_HIVE_HS2_SERVICE_NAME = (os.environ.get("HIVE_HS2_SERVICE_NAME") or "hive").strip()
+_KRB5_CCACHE = (os.environ.get("KRB5_CCACHE") or "").strip()
+
+# Surface an optional ccache override to the GSSAPI layer via the standard env
+# var it reads (KRB5CCNAME), so a non-default kinit cache is picked up cleanly.
+if _KRB5_CCACHE:
+    os.environ["KRB5CCNAME"] = _KRB5_CCACHE
+
+# ── HS2 (optional EXPLAIN enrichment) ─────────────────────────────────────────
+# When HS2_HOST is unset the server runs in HMS-only mode — all discovery tools
+# still work; EXPLAIN-based features (optimize_query, compare_queries) are
+# skipped with a clear message.
 _HS2_HOST = (os.environ.get("HS2_HOST") or "").strip()
-_HS2_PORT = int((os.environ.get("HS2_PORT") or "10000").strip())
+# Default port: 10001 for Cloudera HTTP transport, 10000 for plain binary Thrift.
+_HS2_PORT = int((os.environ.get("HS2_PORT") or ("10001" if _IS_CLOUDERA else "10000")).strip())
 _HS2_USER = (os.environ.get("HS2_USER") or "").strip()
 _HS2_PASSWORD = os.environ.get("HS2_PASSWORD") or ""
 _HS2_DATABASE = (os.environ.get("HS2_DATABASE") or "default").strip()
 _HS2_AUTH = (os.environ.get("HS2_AUTH") or "NONE").strip().upper()
 _HS2_QUERY_TIMEOUT_S = int((os.environ.get("HS2_QUERY_TIMEOUT_S") or "60").strip())
+# Transport mode: Cloudera CDH/CDP uses HTTP on port 10001; standard clusters use
+# Thrift binary on port 10000.  Preset cloudera_kerberos defaults to 'http'.
+_HS2_TRANSPORT_MODE = (
+    os.environ.get("HS2_TRANSPORT_MODE") or ("http" if _IS_CLOUDERA else "binary")
+).strip().lower()
+_HS2_USE_HTTP = _HS2_TRANSPORT_MODE == "http"
 
 if not _HMS_HOST:
     logger.error(
@@ -282,9 +353,30 @@ async def _tool_compare_queries(original_query: str, optimized_query: str) -> st
 
 def main() -> None:
     global _client, _hs2_client
+    logger.info(
+        "Cluster preset: %s | HMS-TLS=%s | HS2-TLS=%s | Kerberos=%s%s",
+        _CLUSTER_PRESET,
+        _HMS_USE_TLS,
+        _HS2_USE_TLS,
+        _HIVE_USE_KERBEROS,
+        f" (principal={_HIVE_KERBEROS_PRINCIPAL})" if _HIVE_KERBEROS_PRINCIPAL else "",
+    )
+    if _HIVE_USE_KERBEROS:
+        logger.info(
+            "Kerberos enabled — a valid TGT must be present. "
+            "Ensure you have run 'kinit' with a valid keytab/principal before starting the server."
+        )
     logger.info("Connecting to HMS at %s:%d", _HMS_HOST, _HMS_PORT)
     try:
-        _client = HMSClient(_HMS_HOST, _HMS_PORT, _TIMEOUT_MS)
+        _client = HMSClient(
+            _HMS_HOST,
+            _HMS_PORT,
+            _TIMEOUT_MS,
+            use_tls=_HMS_USE_TLS,
+            use_kerberos=_HIVE_USE_KERBEROS,
+            kerberos_principal=_HIVE_KERBEROS_PRINCIPAL,
+            kerberos_service_name=_HIVE_HS2_SERVICE_NAME,
+        )
         logger.info("HMS connection established.")
     except Exception as exc:
         logger.error("Failed to connect to HMS: %s", exc)
@@ -303,6 +395,11 @@ def main() -> None:
                 database=_HS2_DATABASE,
                 auth=_HS2_AUTH,
                 timeout_s=_HS2_QUERY_TIMEOUT_S,
+                use_tls=_HS2_USE_TLS,
+                use_kerberos=_HIVE_USE_KERBEROS,
+                kerberos_principal=_HIVE_KERBEROS_PRINCIPAL,
+                kerberos_service_name=_HIVE_HS2_SERVICE_NAME,
+                use_http_transport=_HS2_USE_HTTP,
             )
             logger.info("HS2 connection established — EXPLAIN enrichment enabled.")
         except Exception as exc:
