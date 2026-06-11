@@ -111,6 +111,31 @@ def _collect_partition_stats(
     return out
 
 
+def _parse_partition_name(pn: str) -> dict[str, str]:
+    """Parse 'key=value/key2=value2' into {'key': 'value', 'key2': 'value2'}."""
+    result: dict[str, str] = {}
+    for segment in pn.split("/"):
+        if "=" in segment:
+            k, _, v = segment.partition("=")
+            result[k] = v
+    return result
+
+
+def _partition_key_ranges(part_names: list[str]) -> dict[str, dict[str, str]]:
+    """Return min/max value per partition key across all fetched partition names."""
+    ranges: dict[str, dict[str, str]] = {}
+    for pn in part_names:
+        for k, v in _parse_partition_name(pn).items():
+            if k not in ranges:
+                ranges[k] = {"min": v, "max": v}
+            else:
+                if v < ranges[k]["min"]:
+                    ranges[k]["min"] = v
+                if v > ranges[k]["max"]:
+                    ranges[k]["max"] = v
+    return ranges
+
+
 def _compute_partition_rollup(
     client: "HMSClient",
     database: str,
@@ -163,6 +188,8 @@ def _compute_partition_rollup(
 
     return {
         "stats_map": stats_map,
+        "part_names": part_names,
+        "key_ranges": _partition_key_ranges(part_names),
         "scanned": len(part_names),
         "truncated": truncated,
         "sum_rows": sum_rows,
@@ -181,21 +208,22 @@ def _append_derived_table_stats(lines: list[str], rollup: dict) -> bool:
     Returns True if any derived total was emitted, False otherwise (e.g. no
     partitions have stats, or the partition listing failed).
     """
-    if "error" in rollup or not rollup.get("stats_map"):
+    if "error" in rollup or not rollup.get("part_names"):
         return False
     if not (rollup["rows_cov"] or rollup["size_cov"] or rollup["files_cov"]):
         return False
 
     scanned = rollup["scanned"]
-    note = ""
     if rollup["truncated"]:
         note = (
             f" [partial: first {scanned} partitions scanned; table has more — "
             "treat totals as a lower bound]"
         )
+    else:
+        note = f" (aggregated from all {scanned} partition(s))"
     lines.append(
-        "Derived table-level totals (aggregated from partition BASIC_STATS; Hive does "
-        f"not roll these into table-level stats for partitioned tables){note}:"
+        "Derived table-level totals (Hive does not roll partition BASIC_STATS "
+        f"into table-level stats for partitioned tables){note}:"
     )
 
     def _line(label: str, value: str, cov: int) -> str:
@@ -216,13 +244,20 @@ def _append_partition_basic_stats(
     rollup: dict,
     sample_cap: int = PARTITION_SAMPLE_CAP,
 ) -> None:
-    """Append a per-partition BASIC_STATS sample (up to sample_cap rows) from a rollup."""
+    """Append partition key ranges and a head/tail BASIC_STATS sample from a rollup.
+
+    Shows up to sample_cap partition lines split evenly between the first and last
+    partitions in HMS order, with an omission line in between when the total exceeds
+    the cap.  A key-range summary block always precedes the per-partition lines so
+    the LLM can reason about the covered date/value range without reading every row.
+    """
     if "error" in rollup:
         lines.append(f"Partition-level BASIC_STATS: could not list partitions: {rollup['error']}")
         return
 
+    part_names: list[str] = rollup.get("part_names", [])
     stats_map: dict[str, dict[str, str]] = rollup.get("stats_map", {})
-    if not stats_map:
+    if not part_names:
         lines.append(
             "Partition-level BASIC_STATS: no partition data found "
             "(table may be empty or not yet populated)."
@@ -230,23 +265,48 @@ def _append_partition_basic_stats(
         return
 
     scanned = rollup["scanned"]
-    shown = min(len(stats_map), sample_cap)
-    more = "+" if rollup["truncated"] else ""
+
+    # --- key ranges block ---
+    key_ranges = rollup.get("key_ranges", {})
+    if key_ranges:
+        lines.append(f"Partition key ranges (from {scanned} partition(s)):")
+        for k, rng in key_ranges.items():
+            lines.append(f"  {k}: min={rng['min']}  max={rng['max']}")
+
+    # --- head / tail sample ---
+    half = max(1, sample_cap // 2)
+    if scanned <= sample_cap:
+        sample_head = part_names
+        sample_tail: list[str] = []
+        omitted = 0
+    else:
+        sample_head = part_names[:half]
+        sample_tail = part_names[-half:]
+        omitted = scanned - 2 * half
+
     lines.append(
-        f"Partition-level BASIC_STATS sample (showing {shown} of {scanned}{more} partition(s)):"
+        f"Partition-level BASIC_STATS sample ({min(scanned, sample_cap)} of "
+        f"{scanned} partition(s); totals above cover all):"
     )
-    for i, (pn, pst) in enumerate(stats_map.items()):
-        if i >= sample_cap:
-            lines.append(f"  ... {len(stats_map) - sample_cap} more partition(s) not shown")
-            break
+
+    def _stat_line(pn: str) -> str:
+        pst = stats_map.get(pn)
+        if not pst:
+            return f"  {pn}  (stats not fetched)"
         nr, nf, sz = pst["num_rows"], pst["num_files"], pst["total_size"]
         if nr == "-1" and nf == "-1" and sz == "-1":
-            lines.append(f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)")
-        else:
-            lines.append(
-                f"  {pn}  rows={_format_count(nr)}  "
-                f"files={_format_count(nf)}  size={_format_bytes(sz)}"
-            )
+            return f"  {pn}  (no BASIC_STATS — run ANALYZE TABLE ... PARTITION)"
+        return (
+            f"  {pn}  rows={_format_count(nr)}  "
+            f"files={_format_count(nf)}  size={_format_bytes(sz)}"
+        )
+
+    for pn in sample_head:
+        lines.append(_stat_line(pn))
+    if omitted > 0:
+        lines.append(f"  ... {omitted} partition(s) omitted ...")
+    for pn in sample_tail:
+        lines.append(_stat_line(pn))
 
 
 async def handle_list_databases(client: "HMSClient") -> str:
