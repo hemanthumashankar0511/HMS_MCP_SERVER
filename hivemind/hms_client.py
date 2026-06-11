@@ -187,25 +187,21 @@ _SEARCH_RESULTS_CAP = 30
 # the full _SEARCH_RESULTS_CAP instead.
 _SEARCH_COLUMN_MATCH_PER_DB = 20
 
-# Partitions scanned to derive table-level totals. Hive never rolls partition
-# BASIC_STATS up into a table-level numRows and no HMS API computes it, so we
-# enumerate partitions and sum. Kept deliberately small so partition-related
-# questions stay fast: high-partition-count tables would otherwise pull many heavy
-# Partition objects over Thrift. When a table has more partitions than this, the
-# derived totals are flagged as a lower bound rather than scanning everything.
-PARTITION_ROLLUP_CAP = 500
+# Hard ceiling of the HMS get_partition_names Thrift signature (i16 max_parts).
+_HMS_MAX_PARTS_I16 = 32767
 
-# Partitions shown individually in sample output. Sliced from the rollup scan above,
-# so it never exceeds PARTITION_ROLLUP_CAP.
-PARTITION_SAMPLE_CAP = 500
+# Partitions enumerated to derive accurate table-level totals. Set to the HMS i16
+# max so every partition is included in rollup sums; the display layer shows only a
+# small representative sample rather than dumping the full list to the LLM.
+PARTITION_ROLLUP_CAP = _HMS_MAX_PARTS_I16
+
+# Partitions shown individually in LLM-facing output (head + tail sampling).
+# Separate from PARTITION_ROLLUP_CAP: rollup always scans all partitions for
+# accurate totals, while sample controls how many lines appear in the response.
+PARTITION_SAMPLE_CAP = 30
 
 # Batch size for the rollup scan (get_partitions_by_names per chunk).
 _PARTITION_ROLLUP_BATCH = 500
-
-# Hard ceiling of the HMS get_partition_names Thrift signature (i16 max_parts = 32767).
-# PARTITION_ROLLUP_CAP (500) keeps all requests well below this limit, so this
-# constant is kept as a reference but is not included in the active cap expression.
-_HMS_MAX_PARTS_I16 = 32767
 
 
 def _friendly_format(class_name: str) -> str:
@@ -482,8 +478,9 @@ class HMSClient:
         Return up to max_parts partition name strings for the given table.
 
         Partition names are returned in HMS-native format (e.g. 'year=2024/month=01').
-        The cap is bounded by PARTITION_ROLLUP_CAP (and the HMS i16 limit) to keep
-        partition lookups fast; the display layer slices a smaller sample from the front.
+        The cap defaults to PARTITION_ROLLUP_CAP (HMS i16 max) so callers get the full
+        partition list for accurate rollup totals; the display layer applies PARTITION_SAMPLE_CAP
+        to show a representative head/tail sample rather than all names.
         """
         cap = max(1, min(int(max_parts), PARTITION_ROLLUP_CAP))
         return self._call("get_partition_names", database, table, cap)

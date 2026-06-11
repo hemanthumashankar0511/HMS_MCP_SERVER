@@ -247,8 +247,9 @@ async def _tool_get_table_stats(database: str, table: str) -> str:
 @mcp.tool(
     name="get_partitions",
     description=(
-        "Fetch partition key definitions and per-partition BASIC_STATS (rows, size, files) "
-        "for a Hive table. Returns up to 500 partitions with derived table-level totals."
+        "Fetch partition key definitions for a Hive table. Returns partition key ranges "
+        "(min/max per key), a representative sample (~30 partitions, head + tail), and "
+        "derived table-level totals aggregated over all partitions (up to HMS i16 max)."
     ),
 )
 async def _tool_get_partitions(database: str, table: str) -> str:
